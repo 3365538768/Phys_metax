@@ -568,3 +568,115 @@ def save_fields_for_frame(
             save_J=True,
         )
 
+
+def write_stress_pcd_camera_meta_json(
+    path: str,
+    *,
+    viewpoint_center_worldspace: np.ndarray,
+    observant_coordinates: np.ndarray,
+    num_views: int,
+    init_azimuthm: float,
+    init_elevation: float,
+    init_radius: float,
+    model_path: Optional[str] = None,
+    default_camera_index: int = -1,
+    move_camera: bool = False,
+    delta_a: float = 0.0,
+    delta_e: float = 0.0,
+    delta_r: float = 0.0,
+    field_output_interval: int = 1,
+    fov_vertical_deg: float = 60.0,
+    fov_horizontal_deg: float = 60.0,
+    width_hint: int = 800,
+    height_hint: int = 800,
+    mpm_to_world: Optional[Dict] = None,
+    mpm_space_viewpoint_center: Optional[List[float]] = None,
+) -> None:
+    """
+    写入与 modified_simulation 中「方位角均匀分布 + synthetic 轨道相机」一致的参数，
+    供 my_utils/visualize_fields.py 离线渲染多视角点云应力图（与 Gaussian 合成相机大致对齐）。
+
+    camera_motion（delta_* / move_camera）供离线按仿真帧号重算 eye，与 get_camera_view(..., current_frame=frame) 一致。
+
+    mpm_to_world：与 undo_all_transforms 一致，将 deformation_field 中 MPM 坐标变到与 3DGS 渲染相同的世界系。
+
+    说明：若存在 cameras.json 且 default_camera_index > -1，Gaussian 侧可能固定使用 COLMAP 相机，
+    此时本 meta 中的环绕视角与 RGB 渲染不一定一致，见写入的 warnings 字段。
+    """
+    from utils.camera_view_utils import get_camera_position_and_rotation
+
+    vc = np.asarray(viewpoint_center_worldspace, dtype=np.float64).reshape(3)
+    obs = np.asarray(observant_coordinates, dtype=np.float64).reshape(3, 3)
+    up = obs[:, 2].astype(np.float64)
+    nup = np.linalg.norm(up)
+    if nup < 1e-12:
+        up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    else:
+        up = up / nup
+
+    nv = max(1, int(num_views))
+    views: List[Dict] = []
+    az_base = float(init_azimuthm)
+    el_base = float(init_elevation)
+    rad = float(init_radius)
+
+    for k in range(nv):
+        az = (az_base + 360.0 * k / nv) % 360.0
+        el = el_base
+        name = f"az{int(round(az))}_el{int(round(el))}"
+        eye, _R = get_camera_position_and_rotation(az, el, rad, vc, obs)
+        eye = np.asarray(eye, dtype=np.float64).reshape(3)
+        views.append(
+            {
+                "name": name,
+                "azimuth": az,
+                "elevation": el,
+                "eye": eye.tolist(),
+            }
+        )
+
+    warnings: List[str] = []
+    if model_path:
+        cj = os.path.join(model_path, "cameras.json")
+        if os.path.isfile(cj) and int(default_camera_index) > -1:
+            warnings.append(
+                "检测到 cameras.json 且 default_camera_index>-1：Gaussian 可能始终使用单一 COLMAP 相机，"
+                "与本文件中的多视角环绕轨迹不一致。"
+            )
+
+    payload = {
+        "version": 3,
+        "description": (
+            "与 utils.camera_view_utils.get_camera_position_and_rotation 一致，"
+            "对应 modified_simulation 中 num_views / num_render_views 的方位角分布；"
+            "v3 增加 mpm_to_world，使 deformation_field 与 3DGS 使用同一世界坐标系。"
+        ),
+        "look_at": vc.tolist(),
+        "world_up": up.tolist(),
+        "observant_coordinates": obs.tolist(),
+        "fov_vertical_deg": float(fov_vertical_deg),
+        "fov_horizontal_deg": float(fov_horizontal_deg),
+        "width_hint": int(width_hint),
+        "height_hint": int(height_hint),
+        "init_radius": rad,
+        "camera_motion": {
+            "move_camera": bool(move_camera),
+            "delta_a": float(delta_a),
+            "delta_e": float(delta_e),
+            "delta_r": float(delta_r),
+            "field_output_interval": int(field_output_interval),
+        },
+        "warnings": warnings,
+        "views": views,
+    }
+    if mpm_space_viewpoint_center is not None:
+        payload["mpm_space_viewpoint_center"] = [
+            float(x) for x in mpm_space_viewpoint_center
+        ]
+    if mpm_to_world is not None:
+        payload["mpm_to_world"] = mpm_to_world
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+

@@ -1,0 +1,64 @@
+数据集生成（auto_simulation_runner + modified_simulation）扩展任务
+
+目标：生成更全面的仿真数据集，在「可训练/可评估」标签之外，显式记录渲染与视角相关配置，并以 2D 形式输出应力与形变轨迹（避免大体积三维场文件）。
+
+一、train_config.json 中建议综合记录的字段（与 auto_simulation_runner 读取一致）
+
+1) 已有/常用
+   - num_simulations, sim_types, seed, output_root
+   - base_config_by_sim_type
+   - num_views：渲染方位角均匀分布的视角数量（与原先一致）
+   - render_img, compile_video, white_bg, debug
+   - output_deformation, output_stress, field_output_interval（体积 npz；可与下面「关闭体积」配合）
+   - output_bc_info, output_force_info
+
+2) 新增（渲染时间采样与视角）
+   - num_render_views（可选）：显式声明「渲染视角数量」。若不写则与 num_views 相同；写 -1 亦表示沿用 num_views。
+   - num_render_timesteps（可选，默认 0）：
+       * 0 或 ≥ 仿真总帧数：每个仿真时间步都输出一帧渲染/视角辅助（与原先每帧出图一致，文件名按输出序号 0000.. 对齐）。
+       * 正整数 K：在整段仿真时间上**含端点均匀**取 K 个仿真帧做输出；RGB、应力热力图、2D 轨迹在该时刻同时采样，帧数一致。
+     「总共渲染多少张图」在固定视角数 V 下，为 K×V（每个视角 K 张）；K 由 num_render_timesteps 控制。
+
+3) 视角内 2D 产物（不写三维 stress/deformation 体数据时可关体积开关）
+   - output_view_stress_heatmap：true 时，每个视角目录下写 stress_heatmaps/<view_name>/{out_idx:04d}.png
+       基于 Cauchy 应力的 von Mises（与 save_stress_field 同式：σ=τ/det(F_trial)）。在**每个渲染采样帧**会先调用
+       `recompute_particle_stress_from_F_trial(substep_dt)`，使 Kirchhoff τ 与 g2p 更新后的 F_trial 一致，再 splat。
+       仅对光栅 radii>0 的粒子绘制（与 RGB 同一相机、同一 out_idx）。
+   - output_view_tracks2d：true 时写 tracks_2d/<view_name>.npz（`modified_simulation` 中 `_VIEW_TRACKS2D_TEMP_DISABLED` 可暂时关闭）。
+   - 推理速度排查：`modified_simulation` 顶部 `_VIEW_STRESS_HEATMAP_TEMP_DISABLED=True` 时跳过热力图目录、帧前 `recompute`、每视角 splat 与应力读取（仍可走 RGB 渲染）。
+   - no_volumetric_stress_deformation：true 时，不写 deformation_field/、stress_field/ 下按帧大 npz（仍保留 meta、渲染与上述 2D 产物）。
+
+二、单次仿真输出目录约定（在各自 job 的 output_path 下）
+
+   images/<view_name>/{out_idx:04d}.png          # render_img 时
+   stress_heatmaps/<view_name>/{out_idx:04d}.png
+   tracks_2d/<view_name>.npz
+   meta/run_parameters.json                     # 汇总：仿真类型、帧数、渲染索引、材质与时间参数、各开关等
+   videos/<view_name>.mp4                       # compile_video 且 render_img 时
+
+三、与 my_model 训练数据的关系
+
+   新字段主要影响仿真侧目录与 meta；构建 dataset_400 类布局时，应读取 meta/run_parameters.json 将 num_render_views_effective、num_render_outputs、render_frame_indices 等写入样本级 manifest，便于与视频帧对齐。
+
+四、仿真原始输出目录（auto_simulation_runner）
+
+   - 默认 `train_config` 中 `output_layout` 为 **`by_model`**：
+     `auto_output/<PLY 文件名不含扩展名>/<obj__params__sim_type>/<obj>/...`
+     即**先按物体**再按单次 run，不再使用 `auto_output/<bend|drop|...>/` 顶层。
+   - 若需恢复旧结构，在 train_config 中设 `"output_layout": "by_action"`。
+
+五、整理为「按 model 分子目录」的数据集（dataset_full_test 等）
+
+   使用仓库根目录 `transform_dataset.py`，与 dataset_400 **同一套单样本内容**（images/、gt.json、boundary_conditions.json），仅顶层目录不同：
+
+   ```bash
+   python transform_dataset.py --layout by_model --out_name dataset_full_test [--copy_aux]
+   ```
+   （`transform_dataset` 已同时扫描「按动作」与「按物体」两种原始 auto_output 布局。）
+
+   得到：
+   - `auto_output/dataset_full_test/<object_slug 安全化>/<6位序号>/`
+   - 每个 object（model）独占一级子目录，其下 000000、000001… 为该物体多条仿真样本，便于后续按物体做 train/test/val 划分。
+   - `manifest.json`：`layout=by_model`、`models` 汇总、`samples` 含 `relative_path`、`index_in_model` 等。
+
+   默认 `train_test` 布局不变：`auto_output/dataset_400/train|test/<编号>/`。

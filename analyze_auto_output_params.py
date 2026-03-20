@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-扫描 auto_output 下所有仿真结果目录，解析文件夹名中的参数，
+扫描 auto_output 下所有仿真结果目录，解析文件夹名中的参数或 gt_parameters.json，
 并输出 E / nu / density / yield_stress / hardening / softening 的分布统计图。
 
 输出：
@@ -12,6 +12,7 @@
 - auto_output/stats/params_hist_softening.png
 """
 
+import json
 import os
 from pathlib import Path
 from collections import defaultdict, Counter
@@ -61,12 +62,56 @@ def _parse_params_to_dict(params_str: str) -> dict:
     return result
 
 
+def _accumulate_from_gt_json(gt_path: Path, counts_by_action: Counter, values: defaultdict) -> None:
+    """从 gt_parameters.json 读取 sim_type 与 material_params。"""
+    try:
+        with open(gt_path, "r", encoding="utf-8") as f:
+            gt = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    action = gt.get("sim_type", "")
+    if action not in ACTION_NAMES:
+        return
+    counts_by_action[action] += 1
+    mp = gt.get("material_params") or {}
+    for key in TARGET_KEYS:
+        if key not in mp:
+            continue
+        try:
+            v = float(mp[key])
+        except (TypeError, ValueError):
+            continue
+        values[key].append(v)
+
+
+def _parse_one_run_folder(name: str, counts_by_action: Counter, values: defaultdict) -> None:
+    """解析名为 OBJECT__PARAMS__action 的目录名，累加 counts 与 values。"""
+    if "__" not in name:
+        return
+    segs = name.split("__")
+    if len(segs) < 3:
+        return
+    action = segs[-1]
+    if action not in ACTION_NAMES:
+        return
+    params_str = "__".join(segs[1:-1])
+    params = _parse_params_to_dict(params_str)
+    counts_by_action[action] += 1
+    for key in TARGET_KEYS:
+        if key not in params:
+            continue
+        try:
+            v = float(params[key])
+        except ValueError:
+            continue
+        values[key].append(v)
+
+
 def _collect_params(auto_output_root: Path):
     """
-    从 auto_output/<action>/<obj__params__action>/ 这种结构中解析参数。
-    返回：
-      - values: {key: [float, ...]}
-      - counts_by_action: Counter 动作计数
+    从 auto_output 下仿真目录解析参数。支持：
+    - auto_output/<action>/<obj__params__action>/
+    - auto_output/<model>/<obj__params__action>/  （按物体一级目录）
     """
     values = defaultdict(list)
     counts_by_action = Counter()
@@ -75,31 +120,36 @@ def _collect_params(auto_output_root: Path):
         action_dir = auto_output_root / action
         if not action_dir.is_dir():
             continue
-
         for run_dir in action_dir.iterdir():
             if not run_dir.is_dir():
                 continue
-            name = run_dir.name
-            # 形如 OBJECT__PARAMS__action
-            if "__" not in name:
+            _parse_one_run_folder(run_dir.name, counts_by_action, values)
+        # 新：<action>/<model>/<NNNN>/gt_parameters.json
+        for model_sub in sorted(action_dir.iterdir(), key=lambda p: p.name):
+            if not model_sub.is_dir():
                 continue
-            segs = name.split("__")
-            if len(segs) < 3:
+            if model_sub.name in ACTION_NAMES:
                 continue
-            obj_name = segs[0]
-            params_str = "__".join(segs[1:-1])
-            params = _parse_params_to_dict(params_str)
-
-            counts_by_action[action] += 1
-
-            for key in TARGET_KEYS:
-                if key not in params:
+            for run_dir in sorted(model_sub.iterdir(), key=lambda p: p.name):
+                if not run_dir.is_dir() or not run_dir.name.isdigit():
                     continue
-                try:
-                    v = float(params[key])
-                except ValueError:
-                    continue
-                values[key].append(v)
+                gp = run_dir / "gt_parameters.json"
+                if gp.is_file():
+                    _accumulate_from_gt_json(gp, counts_by_action, values)
+
+    skip_top = set(ACTION_NAMES) | {"_tmp_configs", "stats", "combined"}
+    for model_top in sorted(auto_output_root.iterdir()):
+        if not model_top.is_dir() or model_top.name in skip_top:
+            continue
+        for run_dir in sorted(model_top.iterdir(), key=lambda p: p.name):
+            if not run_dir.is_dir():
+                continue
+            if run_dir.name.isdigit():
+                gp = run_dir / "gt_parameters.json"
+                if gp.is_file():
+                    _accumulate_from_gt_json(gp, counts_by_action, values)
+                continue
+            _parse_one_run_folder(run_dir.name, counts_by_action, values)
 
     return values, counts_by_action
 

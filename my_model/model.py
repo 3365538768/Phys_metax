@@ -1,7 +1,7 @@
 """
 物理参数预测模型：Image Encoder + Transformer + 物理参数头 + 动作头
 """
-import math
+import inspect
 from typing import Tuple
 
 import torch
@@ -32,7 +32,8 @@ class ImageEncoder(nn.Module):
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
         feat = self.backbone(x)
-        feat = feat.view(B, T, -1)
+        # 保证 contiguous，减轻 DDP 下部分 Conv 梯度 stride 与 bucket 不一致的警告
+        feat = feat.contiguous().view(B, T, -1)
         return feat
 
 
@@ -40,6 +41,10 @@ class PhysPredictor(nn.Module):
     """
     时序图像 -> 物理参数 + 动作分类
     Image Encoder -> Transformer -> Physics Head + Action Head
+
+    physics_head_mode:
+      - "single": 一个 MLP 输出 4 维（架构 1）
+      - "multi": 四个独立小 MLP 各输出 1 维（架构 2）
     """
 
     def __init__(
@@ -50,10 +55,12 @@ class PhysPredictor(nn.Module):
         nhead: int = 8,
         num_layers: int = 4,
         dropout: float = 0.1,
+        physics_head_mode: str = "single",
     ):
         super().__init__()
         self.feat_dim = feat_dim
         self.d_model = d_model
+        self.physics_head_mode = physics_head_mode
 
         self.image_encoder = ImageEncoder(pretrained=True, feat_dim=feat_dim)
         self.feat_proj = nn.Linear(feat_dim, d_model)
@@ -67,15 +74,40 @@ class PhysPredictor(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # norm_first=True 时 PyTorch 不会用 nested tensor，仍会报警告；显式关闭可消音
+        _te_sig = inspect.signature(nn.TransformerEncoder.__init__)
+        _te_kw = {}
+        if "enable_nested_tensor" in _te_sig.parameters:
+            _te_kw["enable_nested_tensor"] = False
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, **_te_kw
+        )
 
         # 物理参数回归头 (E, nu, density, yield_stress)，E/density/yield_stress 需为正
-        self.physics_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, len(NUM_FEATURES)),
-        )
+        if physics_head_mode == "single":
+            self.physics_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, len(NUM_FEATURES)),
+            )
+            self.physics_heads = None
+        elif physics_head_mode == "multi":
+            self.physics_head = None
+            hid = max(64, d_model // 2)
+            self.physics_heads = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(d_model, hid),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hid, 1),
+                    )
+                    for _ in range(len(NUM_FEATURES))
+                ]
+            )
+        else:
+            raise ValueError(f"未知 physics_head_mode: {physics_head_mode}")
 
         # 动作分类头
         self.action_head = nn.Sequential(
@@ -113,7 +145,11 @@ class PhysPredictor(nn.Module):
         # 取最后一帧或 mean pooling 作为全局表示
         pooled = seq[:, -1, :]  # (B, d_model)
 
-        params_raw = self.physics_head(pooled)
+        if self.physics_head_mode == "single":
+            params_raw = self.physics_head(pooled)
+        else:
+            parts = [h(pooled).squeeze(-1) for h in self.physics_heads]
+            params_raw = torch.stack(parts, dim=1)
         # E, nu, density, yield_stress: 确保 E/density/yield_stress 非负，nu 在 [0,1]
         # 注意：避免对 tensor view 做 inplace slice 赋值（会触发 autograd 的 inplace 版本冲突）
         e = F.softplus(params_raw[:, 0])
@@ -132,11 +168,18 @@ def create_model(
     d_model: int = 256,
     nhead: int = 8,
     num_layers: int = 4,
+    arch: int = 1,
 ) -> PhysPredictor:
+    """
+    arch=1: 单一物理参数头（shared MLP -> 4 维）
+    arch=2: 多物理头（每个标量独立 MLP）
+    """
+    mode = "single" if int(arch) == 1 else "multi"
     return PhysPredictor(
         num_frames=num_frames,
         feat_dim=512,
         d_model=d_model,
         nhead=nhead,
         num_layers=num_layers,
+        physics_head_mode=mode,
     )

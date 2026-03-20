@@ -519,6 +519,24 @@ class MPM_Simulator_WARP:
         #### CFL check ####
         self.time = self.time + dt
 
+    def recompute_particle_stress_from_F_trial(
+        self, dt: float, device: str = "cuda:0"
+    ) -> None:
+        """
+        在整步 p2g2p（含 g2p 更新 F_trial）之后、仅做可视化/导出前调用。
+
+        每步子步末尾 g2p 会更新 particle_F_trial，但 particle_stress 仍对应本子步
+        「开始时」的 return mapping；若不刷新，Cauchy/von Mises 会与当前变形不一致。
+        此核与同一步 p2g2p 开头的 compute_stress_from_F_trial 相同，使 τ、particle_F
+        与当前 F_trial 对齐；下一子步开头会再次执行同一逻辑，此处为幂等刷新。
+        """
+        wp.launch(
+            kernel=compute_stress_from_F_trial,
+            dim=self.n_particles,
+            inputs=[self.mpm_state, self.mpm_model, float(dt)],
+            device=device,
+        )
+
     # set particle densities to all_particle_densities,
     def reset_densities_and_update_masses(
         self, all_particle_densities, device="cuda:0"

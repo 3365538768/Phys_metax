@@ -1,7 +1,7 @@
 {
   "material_spaces": {
     "jelly": {
-      "E": { "type": "log_uniform", "min": 3000.0, "max": 60000.0 },
+      "E": { "type": "log_uniform", "min": 3000.0, "max": 50000.0 },
       "nu": { "type": "uniform", "min": 0.34, "max": 0.46 },
       "density": { "type": "uniform", "min": 850.0, "max": 1250.0 },
       "grid_lim": 2.0,

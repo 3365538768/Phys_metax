@@ -21,6 +21,12 @@ from diff_gaussian_rasterization import (
 from scene.cameras import Camera as GSCamera
 from gaussian_renderer import render, GaussianModel
 from utils.system_utils import searchForMaxIteration
+from my_utils.filling_cache import (
+    build_filling_fingerprint,
+    cache_dir_for_checkpoint_model,
+    save_filled_positions,
+    try_load_filled_positions,
+)
 from utils.graphics_utils import focal2fov 
 
 # MPM dependencies
@@ -79,6 +85,11 @@ if __name__ == "__main__":
     parser.add_argument("--compile_video", action="store_true")
     parser.add_argument("--white_bg", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--no_filling_cache",
+        action="store_true",
+        help="禁用粒子填充磁盘缓存，强制每次执行 fill_particles。",
+    )
 
     args = parser.parse_args()
 
@@ -190,22 +201,67 @@ if __name__ == "__main__":
     filling_params = preprocessing_params["particle_filling"]
 
     if filling_params is not None:
-        print("Filling internal particles...")
-        mpm_init_pos = fill_particles(
-            pos=transformed_pos,
-            opacity=init_opacity,
-            cov=init_cov,
-            grid_n=filling_params["n_grid"],
-            max_samples=filling_params["max_particles_num"],
-            grid_dx=material_params["grid_lim"] / filling_params["n_grid"],
-            density_thres=filling_params["density_threshold"],
-            search_thres=filling_params["search_threshold"],
-            max_particles_per_cell=filling_params["max_partciels_per_cell"],
-            search_exclude_dir=filling_params["search_exclude_direction"],
-            ray_cast_dir=filling_params["ray_cast_direction"],
-            boundary=filling_params["boundary"],
-            smooth=filling_params["smooth"],
-        ).to(device=device)
+        use_filling_cache = not bool(args.no_filling_cache)
+        checkpt_dir = os.path.join(os.path.abspath(model_path), "point_cloud")
+        ckpt_iter = searchForMaxIteration(checkpt_dir)
+        ply_for_fp = os.path.join(
+            checkpt_dir, f"iteration_{ckpt_iter}", "point_cloud.ply"
+        )
+        cache_dir = cache_dir_for_checkpoint_model(model_path, ckpt_iter)
+        fingerprint = None
+        mpm_init_pos = None
+
+        if use_filling_cache and os.path.isfile(ply_for_fp):
+            fingerprint = build_filling_fingerprint(
+                ply_path=ply_for_fp,
+                preprocessing_params=preprocessing_params,
+                material_params=material_params,
+                filling_params=filling_params,
+                ply_extra_x90=False,
+            )
+            mpm_init_pos = try_load_filled_positions(
+                cache_dir, fingerprint, device, gs_num
+            )
+
+        if mpm_init_pos is not None:
+            print(
+                f"[particle filling] 使用缓存: {cache_dir} "
+                f"(fingerprint={fingerprint[:16]}...)"
+            )
+        else:
+            print("Filling internal particles...")
+            mpm_init_pos = fill_particles(
+                pos=transformed_pos,
+                opacity=init_opacity,
+                cov=init_cov,
+                grid_n=filling_params["n_grid"],
+                max_samples=filling_params["max_particles_num"],
+                grid_dx=material_params["grid_lim"] / filling_params["n_grid"],
+                density_thres=filling_params["density_threshold"],
+                search_thres=filling_params["search_threshold"],
+                max_particles_per_cell=filling_params["max_partciels_per_cell"],
+                search_exclude_dir=filling_params["search_exclude_direction"],
+                ray_cast_dir=filling_params["ray_cast_direction"],
+                boundary=filling_params["boundary"],
+                smooth=filling_params["smooth"],
+            ).to(device=device)
+
+            if (
+                use_filling_cache
+                and fingerprint
+                and os.path.isfile(ply_for_fp)
+            ):
+                save_filled_positions(
+                    cache_dir,
+                    fingerprint,
+                    mpm_init_pos,
+                    gs_num,
+                    meta_extra={
+                        "ply_basename": os.path.basename(ply_for_fp),
+                        "task_type": "checkpoint",
+                    },
+                )
+                print(f"[particle filling] 已写入缓存: {cache_dir}")
 
         if args.debug:
             particle_position_tensor_to_ply(mpm_init_pos, "./log/filled_particles.ply")

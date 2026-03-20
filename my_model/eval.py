@@ -6,6 +6,7 @@
 """
 
 import argparse
+import json
 import os
 import subprocess
 from datetime import datetime
@@ -18,10 +19,20 @@ import torch
 from torch.utils.data import DataLoader
 
 try:
-    from my_model.dataset import PhysGaussianDataset, train_test_split
+    from my_model.dataset import (
+        Dataset400,
+        PhysGaussianDataset,
+        resolve_flat_dataset_root,
+        train_test_split,
+    )
     from my_model.model import create_model
 except ImportError:
-    from .dataset import PhysGaussianDataset, train_test_split
+    from .dataset import (
+        Dataset400,
+        PhysGaussianDataset,
+        resolve_flat_dataset_root,
+        train_test_split,
+    )
     from .model import create_model
 
 
@@ -139,21 +150,84 @@ def plot_rel_err_hist(gt, pred, param_name, out_path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--physgaussian_root", type=str, default=str(Path(__file__).resolve().parents[1]))
-    parser.add_argument("--checkpoint", type=str, default="my_model/checkpoints/final.pt")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="默认 my_model/checkpoints/<arch>/final.pt",
+    )
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_frames", type=int, default=16)
     parser.add_argument("--img_size", type=int, default=224)
-    parser.add_argument("--out_dir", type=str, default="my_model/visualizations")
+    parser.add_argument(
+        "--data_layout",
+        type=str,
+        choices=("dataset_400", "legacy"),
+        default="dataset_400",
+        help="dataset_400：使用扁平集 test/（见 --dataset_dir）；legacy：auto_output 上 7:3 划分得到的 test",
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default="dataset_400",
+        help="仅 data_layout=dataset_400：推荐 dataset_400；或 auto_output/dataset_400（相对仓库根）；或绝对路径。须与训练一致。",
+    )
+    parser.add_argument(
+        "--arch",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="须与训练一致；若 checkpoint 内含 arch 字段则以其为准",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="可视化根目录，默认 my_model/visualizations/<arch>/，其下再建时间戳子目录",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--auto_gpu", action="store_true", help="自动选择最空闲的 GPU（仅 eval 用 1 张卡）")
+    parser.add_argument(
+        "--no_dataset_preflight",
+        action="store_true",
+        help="dataset_400 快速加载：跳过 cv2 首帧与多帧预检（仅检查目录与是否有图片）",
+    )
 
     args = parser.parse_args()
     root = Path(args.physgaussian_root).resolve()
     auto_output = root / "auto_output"
-    ckpt_path = root / args.checkpoint
-    base_vis = root / args.out_dir
+
+    ckpt_path = root / (args.checkpoint or f"my_model/checkpoints/{args.arch}/final.pt")
+    arch = args.arch
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict) and "model_state_dict" in state:
+        arch = int(state.get("arch", arch))
+        hp = state.get("train_hparams") or {}
+        if hp:
+            nf = hp.get("num_frames")
+            ih = hp.get("img_size")
+            if nf is not None and int(nf) != int(args.num_frames):
+                print(
+                    f"[eval] 警告：checkpoint 记录 num_frames={nf}，当前 --num_frames={args.num_frames}，"
+                    "推理应与训练一致，请调整 CLI。"
+                )
+            if ih is not None and int(ih) != int(args.img_size):
+                print(
+                    f"[eval] 警告：checkpoint 记录 img_size={ih}，当前 --img_size={args.img_size}。"
+                )
+            slug = hp.get("ckpt_config_slug")
+            if slug:
+                print(f"[eval] checkpoint 配置标签: {slug}")
+            ds_ckpt = hp.get("dataset_dir")
+            if ds_ckpt and str(ds_ckpt) != str(args.dataset_dir):
+                print(
+                    f"[eval] 警告：checkpoint 记录 dataset_dir={ds_ckpt!r}，当前 --dataset_dir={args.dataset_dir!r}，"
+                    "评估集应与训练一致。"
+                )
+
+    base_vis = root / (args.out_dir or f"my_model/visualizations/{arch}")
     base_vis.mkdir(parents=True, exist_ok=True)
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = base_vis / run_stamp
@@ -161,18 +235,34 @@ def main():
 
     device = _auto_select_gpu_if_needed(args)
 
-    _, test_samples = train_test_split(auto_output, args.train_ratio, args.seed)
-    test_dataset = PhysGaussianDataset(
-        auto_output,
-        num_frames=args.num_frames,
-        img_size=args.img_size,
-        sample_ids=test_samples,
-    )
+    if args.data_layout == "dataset_400":
+        layout_root = resolve_flat_dataset_root(args.dataset_dir, auto_output)
+        test_path = layout_root / "test"
+        if not test_path.is_dir():
+            raise SystemExit(f"未找到测试集目录: {test_path}（检查 --dataset_dir）")
+        test_dataset = Dataset400(
+            test_path,
+            num_frames=args.num_frames,
+            img_size=args.img_size,
+            preflight=not args.no_dataset_preflight,
+            verbose_preflight=True,
+        )
+    else:
+        _, test_samples = train_test_split(auto_output, args.train_ratio, args.seed)
+        test_dataset = PhysGaussianDataset(
+            auto_output,
+            num_frames=args.num_frames,
+            img_size=args.img_size,
+            sample_ids=test_samples,
+        )
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
-    model = create_model(num_frames=args.num_frames).to(device)
-    state = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state.get("model_state_dict", state))
+    model = create_model(num_frames=args.num_frames, arch=arch).to(device)
+    if isinstance(state, dict):
+        sd = state.get("model_state_dict", state)
+    else:
+        sd = state
+    model.load_state_dict(sd, strict=True)
 
     pred, gt, action_pred, action_gt = collect_predictions(model, test_loader, device)
     metrics = compute_metrics(pred, gt, action_pred, action_gt)
@@ -181,6 +271,25 @@ def main():
     for i, name in enumerate(PARAM_NAMES):
         print(f"  {name}: MAE={metrics['mae'][i]:.4g}, MAPE={metrics['mape'][i]:.2f}%")
     print(f"  动作分类准确率: {metrics['action_acc']:.2f}%")
+
+    metrics_path = out_dir / "metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "arch": arch,
+                "data_layout": args.data_layout,
+                "dataset_dir": args.dataset_dir if args.data_layout == "dataset_400" else None,
+                "checkpoint": str(ckpt_path),
+                "n_test": len(test_dataset),
+                "mae": {PARAM_NAMES[i]: float(metrics["mae"][i]) for i in range(4)},
+                "mape_pct": {PARAM_NAMES[i]: float(metrics["mape"][i]) for i in range(4)},
+                "action_acc_pct": metrics["action_acc"],
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    print(f"指标已写入 {metrics_path}")
 
     print("生成可视化...")
     for i, name in enumerate(PARAM_NAMES):

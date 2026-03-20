@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 将 auto_output 内所有视频按物体分组拼接，并在画面上叠加参数信息（分行显示）。
-- 物体名：文件夹命名中第一个 __ 之前的部分
-- 参数：第一个 __ 与最后一个 __ 之间的部分，解析为 key=value 并分行显示
+- 物体名：旧布局为文件夹名第一个 __ 之前；新布局（数字目录）读 gt_parameters.json 的 ply_stem
+- 参数：旧布局解析 __ 之间片段；新布局用 gt_parameters.json 的 material_params
 - 输出：auto_output/combined/{物体名}.mp4
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -13,7 +14,7 @@ from pathlib import Path
 from collections import Counter, defaultdict
 
 
-# 只从这 5 个动作目录下查找视频
+# 动作名（用于解析 run 文件夹名末尾段）；支持 auto_output/<action>/ 或 auto_output/<model>/ 两种顶层
 ACTION_NAMES = ("bend", "drop", "press", "shear", "stretch")
 
 
@@ -28,10 +29,20 @@ def _walk_root(auto_output_root: Path):
     return str(root), root
 
 
+def _material_params_to_overlay_str(material_params: dict) -> str:
+    if not material_params:
+        return ""
+    return "_".join(
+        f"{k}={material_params[k]}"
+        for k in sorted(material_params.keys(), key=lambda x: str(x))
+    )
+
+
 def find_all_videos(auto_output_root: Path):
-    """仅从 bend / drop / press / shear / stretch 下的 videos 目录中扫描 mp4（不限定具体文件名）。返回 [(path, object_name, params_str, action), ...]"""
+    """扫描 .../<run>/.../videos/*.mp4。支持顶层为动作名或物体名，以及数字目录 + gt_parameters.json。"""
     results = []
     root_str, walk_root = _walk_root(auto_output_root)
+    ao = auto_output_root.resolve()
     for dirpath, _dirnames, filenames in os.walk(root_str):
         for f in filenames:
             if not f.lower().endswith(".mp4"):
@@ -39,28 +50,65 @@ def find_all_videos(auto_output_root: Path):
             mp4_path = Path(dirpath) / f
             try:
                 rel = mp4_path.relative_to(walk_root)
-                parts = rel.parts  # e.g. ('bend', 'OBJECT__PARAMS__bend', 'OBJECT', 'videos', '任意名.mp4')
-                if len(parts) < 5:
+                parts = rel.parts
+                if len(parts) < 4:
                     continue
-                # 只收集 videos 目录下的 mp4，文件名任意
                 if parts[-2] != "videos":
                     continue
-                action = parts[0]
-                if action not in ACTION_NAMES:
+                normal_path = ao / Path(*parts)
+
+                # 新 by_model：<model>/<NNNN>/videos/*.mp4
+                if len(parts) == 4 and parts[1].isdigit():
+                    gt_path = ao / parts[0] / parts[1] / "gt_parameters.json"
+                    if not gt_path.is_file():
+                        continue
+                    with open(gt_path, "r", encoding="utf-8") as gf:
+                        gt = json.load(gf)
+                    action = gt.get("sim_type", "")
+                    if action not in ACTION_NAMES:
+                        continue
+                    object_name = str(gt.get("ply_stem", parts[0]))
+                    params_str = _material_params_to_overlay_str(gt.get("material_params") or {})
+                    results.append((normal_path, object_name, params_str, action))
+                    continue
+
+                # 新 by_action：<action>/<model>/<NNNN>/videos/*.mp4
+                if (
+                    len(parts) == 5
+                    and parts[0] in ACTION_NAMES
+                    and parts[2].isdigit()
+                ):
+                    gt_path = ao / parts[0] / parts[1] / parts[2] / "gt_parameters.json"
+                    if not gt_path.is_file():
+                        continue
+                    with open(gt_path, "r", encoding="utf-8") as gf:
+                        gt = json.load(gf)
+                    action = gt.get("sim_type", "")
+                    if action != parts[0] or action not in ACTION_NAMES:
+                        continue
+                    object_name = str(gt.get("ply_stem", parts[1]))
+                    params_str = _material_params_to_overlay_str(gt.get("material_params") or {})
+                    results.append((normal_path, object_name, params_str, action))
+                    continue
+
+                # 旧：至少 5 段，run 文件夹名含 __
+                if len(parts) < 5:
                     continue
                 run_folder_name = parts[1]
                 if "__" not in run_folder_name:
                     continue
-                # 格式: object_name__params__action
                 segs = run_folder_name.split("__")
                 if len(segs) < 3:
                     continue
                 object_name = segs[0]
                 params_str = "__".join(segs[1:-1])
-                # 存回普通路径，便于 ffmpeg 等后续使用
-                normal_path = auto_output_root.resolve() / rel
+                action = segs[-1]
+                if action not in ACTION_NAMES:
+                    continue
+                if parts[0] in ACTION_NAMES and parts[0] != action:
+                    continue
                 results.append((normal_path, object_name, params_str, action))
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, OSError, json.JSONDecodeError):
                 continue
     return results
 

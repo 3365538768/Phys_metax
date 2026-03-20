@@ -3,6 +3,8 @@ import sys
 sys.path.append("gaussian-splatting")
 import argparse
 import math
+from typing import Any, List, Optional, Tuple
+
 import cv2
 import torch
 import os
@@ -48,7 +50,28 @@ from my_utils.sim_utils import (
     save_external_force_info,
     setup_field_output_dirs,
     save_fields_for_frame,
+    write_stress_pcd_camera_meta_json,
 )
+from my_utils.view_auxiliary_output import (
+    ViewTrackBuffer,
+    compute_render_frame_indices,
+    frame_to_output_index,
+    splat_stress_heatmap_bgr,
+    stress_scalars_aligned_to_render_chain,
+    write_run_parameters_json,
+)
+from my_utils.filling_cache import (
+    build_filling_fingerprint,
+    cache_dir_for_checkpoint_model,
+    cache_dir_for_ply_model,
+    save_filled_positions,
+    try_load_filled_positions,
+)
+
+# 排查推理速度 / 轨迹：暂时关闭；恢复时改为 False
+_VIEW_TRACKS2D_TEMP_DISABLED = True
+# 视角应力热力图：与 RGB 使用相同相机（--output_view_stress_heatmap）；数据集构建建议开启
+_VIEW_STRESS_HEATMAP_TEMP_DISABLED = False
 
 
 def _select_best_gpu() -> None:
@@ -197,6 +220,12 @@ if __name__ == "__main__":
         default=None,
         help="单个 PLY 文件路径。与 --ply_dir/--model_path 互斥；用于自动化脚本逐个组合调用。",
     )
+    parser.add_argument(
+        "--ply_flat_output",
+        action="store_true",
+        help="单任务 --ply_path 时，直接把仿真输出写到 --output_path（不再在其下再建一层 ply 文件名子目录）。"
+        "供 auto_simulation_runner 等使用。",
+    )
     parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--output_h5", action="store_true", help="保存仿真粒子为 h5（不保存 simulation ply）")
@@ -204,6 +233,11 @@ if __name__ == "__main__":
     parser.add_argument("--compile_video", action="store_true")
     parser.add_argument("--white_bg", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--no_filling_cache",
+        action="store_true",
+        help="禁用粒子填充磁盘缓存，强制每次执行 fill_particles（调试或改 PLY 未改 mtime 时可用）。",
+    )
     #export deformation
     parser.add_argument("--output_deformation", action="store_true")
     parser.add_argument("--output_stress", action="store_true")
@@ -223,8 +257,54 @@ if __name__ == "__main__":
         default=4,
         help="渲染视角数量。仅在方位角上均匀分布（俯仰角用 config 的 init_elevation）。",
     )
+    parser.add_argument(
+        "--num_render_views",
+        type=int,
+        default=-1,
+        help="覆盖渲染视角数；-1 表示使用 --num_views。用于在配置里单独声明「渲染视角数量」。",
+    )
+    parser.add_argument(
+        "--num_render_timesteps",
+        type=int,
+        default=0,
+        help="在整个仿真上均匀输出多少帧的渲染图/视角辅助（0 或 ≥仿真帧数表示每帧都输出）。"
+        "输出文件按 0000..K-1 编号，meta 中记录与仿真帧下标的对应。",
+    )
+    parser.add_argument(
+        "--output_view_stress_heatmap",
+        action="store_true",
+        help="每视角 2D 应力热力图。若 _VIEW_STRESS_HEATMAP_TEMP_DISABLED=True 则暂不生成。",
+    )
+    parser.add_argument(
+        "--output_view_tracks2d",
+        action="store_true",
+        help="每个视角输出 2D 投影轨迹（tracks_2d/*.npz）。当前版本若 _VIEW_TRACKS2D_TEMP_DISABLED=True 则暂不写出。",
+    )
+    parser.add_argument(
+        "--no_volumetric_stress_deformation",
+        action="store_true",
+        help="关闭 deformation_field/ 与 stress_field/ 下按帧的大体积 npz（仍可做渲染与视角辅助）。",
+    )
     #export deformation
     args = parser.parse_args()
+
+    want_tracks2d = bool(args.output_view_tracks2d) and not _VIEW_TRACKS2D_TEMP_DISABLED
+    if _VIEW_TRACKS2D_TEMP_DISABLED and args.output_view_tracks2d:
+        print(
+            "[modified_simulation] 已请求 --output_view_tracks2d，但轨迹输出暂时关闭"
+            "（_VIEW_TRACKS2D_TEMP_DISABLED）。",
+            flush=True,
+        )
+
+    want_stress_heatmap = (
+        bool(args.output_view_stress_heatmap) and not _VIEW_STRESS_HEATMAP_TEMP_DISABLED
+    )
+    if _VIEW_STRESS_HEATMAP_TEMP_DISABLED and args.output_view_stress_heatmap:
+        print(
+            "[modified_simulation] 已请求 --output_view_stress_heatmap，但热力图暂时关闭"
+            "（_VIEW_STRESS_HEATMAP_TEMP_DISABLED），便于排查推理速度。",
+            flush=True,
+        )
 
     use_ply_dir = args.ply_dir is not None and os.path.isdir(args.ply_dir)
     use_ply_path = args.ply_path is not None and os.path.isfile(args.ply_path)
@@ -243,7 +323,11 @@ if __name__ == "__main__":
             raise AssertionError("Scene config does not exist!")
         os.makedirs(args.output_path, exist_ok=True)
         name = os.path.splitext(os.path.basename(args.ply_path))[0]
-        tasks = [("ply", args.ply_path, os.path.join(args.output_path, name), os.path.dirname(args.ply_path))]
+        if args.ply_flat_output:
+            current_out = args.output_path
+        else:
+            current_out = os.path.join(args.output_path, name)
+        tasks = [("ply", args.ply_path, current_out, os.path.dirname(args.ply_path))]
     elif use_ply_dir:
         if not os.path.exists(args.config):
             raise AssertionError("Scene config does not exist!")
@@ -384,22 +468,83 @@ if __name__ == "__main__":
         filling_params = preprocessing_params["particle_filling"]
 
         if filling_params is not None:
-            print("Filling internal particles...")
-            mpm_init_pos = fill_particles(
-                pos=transformed_pos,
-                opacity=init_opacity,
-                cov=init_cov,
-                grid_n=filling_params["n_grid"],
-                max_samples=filling_params["max_particles_num"],
-                grid_dx=material_params["grid_lim"] / filling_params["n_grid"],
-                density_thres=filling_params["density_threshold"],
-                search_thres=filling_params["search_threshold"],
-                max_particles_per_cell=filling_params["max_partciels_per_cell"],
-                search_exclude_dir=filling_params["search_exclude_direction"],
-                ray_cast_dir=filling_params["ray_cast_direction"],
-                boundary=filling_params["boundary"],
-                smooth=filling_params["smooth"],
-            ).to(device=device)
+            use_filling_cache = not bool(args.no_filling_cache)
+            cache_dir = None
+            ply_for_fp = None
+            ply_extra_x90 = False
+            fingerprint = None
+            mpm_init_pos = None
+
+            if use_filling_cache:
+                if task_type == "ply":
+                    ply_for_fp = os.path.abspath(ply_path)
+                    ply_extra_x90 = True
+                    stem = os.path.splitext(os.path.basename(ply_path))[0]
+                    cache_dir = cache_dir_for_ply_model(
+                        os.path.dirname(ply_for_fp), stem
+                    )
+                else:
+                    _ck_dir = os.path.join(os.path.abspath(model_path), "point_cloud")
+                    _ck_iter = searchForMaxIteration(_ck_dir)
+                    ply_for_fp = os.path.join(
+                        _ck_dir, f"iteration_{_ck_iter}", "point_cloud.ply"
+                    )
+                    ply_extra_x90 = False
+                    cache_dir = cache_dir_for_checkpoint_model(model_path, _ck_iter)
+
+                if os.path.isfile(ply_for_fp):
+                    fingerprint = build_filling_fingerprint(
+                        ply_path=ply_for_fp,
+                        preprocessing_params=preprocessing_params,
+                        material_params=material_params,
+                        filling_params=filling_params,
+                        ply_extra_x90=ply_extra_x90,
+                    )
+                    mpm_init_pos = try_load_filled_positions(
+                        cache_dir, fingerprint, device, gs_num
+                    )
+
+            if mpm_init_pos is not None:
+                print(
+                    f"[particle filling] 使用缓存: {cache_dir} "
+                    f"(fingerprint={fingerprint[:16]}...)"
+                )
+            else:
+                print("Filling internal particles...")
+                mpm_init_pos = fill_particles(
+                    pos=transformed_pos,
+                    opacity=init_opacity,
+                    cov=init_cov,
+                    grid_n=filling_params["n_grid"],
+                    max_samples=filling_params["max_particles_num"],
+                    grid_dx=material_params["grid_lim"] / filling_params["n_grid"],
+                    density_thres=filling_params["density_threshold"],
+                    search_thres=filling_params["search_threshold"],
+                    max_particles_per_cell=filling_params["max_partciels_per_cell"],
+                    search_exclude_dir=filling_params["search_exclude_direction"],
+                    ray_cast_dir=filling_params["ray_cast_direction"],
+                    boundary=filling_params["boundary"],
+                    smooth=filling_params["smooth"],
+                ).to(device=device)
+
+                if (
+                    use_filling_cache
+                    and fingerprint
+                    and cache_dir
+                    and ply_for_fp
+                    and os.path.isfile(ply_for_fp)
+                ):
+                    save_filled_positions(
+                        cache_dir,
+                        fingerprint,
+                        mpm_init_pos,
+                        gs_num,
+                        meta_extra={
+                            "ply_basename": os.path.basename(ply_for_fp),
+                            "task_type": task_type,
+                        },
+                    )
+                    print(f"[particle filling] 已写入缓存: {cache_dir}")
 
             if args.debug:
                 particle_position_tensor_to_ply(mpm_init_pos, "./log/filled_particles.ply")
@@ -538,25 +683,89 @@ if __name__ == "__main__":
         height = None
         width = None
 
-        # 准备形变场 / 应力场输出目录
+        save_vol = not bool(args.no_volumetric_stress_deformation)
+        eff_output_deformation = bool(args.output_deformation) and save_vol
+        eff_output_stress_vol = bool(args.output_stress) and save_vol
+
+        # 准备形变场 / 应力场输出目录（大体积 npz）
         deformation_dir, stress_dir = setup_field_output_dirs(
             args.output_path,
-            args.output_deformation,
-            args.output_stress,
+            eff_output_deformation,
+            eff_output_stress_vol,
         )
 
-        # 输出初始帧场数据
-        save_fields_for_frame(
-            mpm_solver,
-            frame_id=0,
-            deformation_dir=deformation_dir,
-            stress_dir=stress_dir,
-            output_deformation=args.output_deformation,
-            output_stress=args.output_stress,
+        render_frame_indices = compute_render_frame_indices(
+            frame_num, int(args.num_render_timesteps)
         )
+        frame_to_out_idx = frame_to_output_index(render_frame_indices)
+        render_frame_set = set(render_frame_indices)
+
+        # 输出初始帧场数据
+        if eff_output_deformation or eff_output_stress_vol:
+            if eff_output_stress_vol:
+                mpm_solver.recompute_particle_stress_from_F_trial(
+                    float(substep_dt), device=device
+                )
+            save_fields_for_frame(
+                mpm_solver,
+                frame_id=0,
+                deformation_dir=deformation_dir,
+                stress_dir=stress_dir,
+                output_deformation=eff_output_deformation,
+                output_stress=eff_output_stress_vol,
+            )
+            # 离线点云应力多视角：与 Gaussian synthetic 轨道相机（方位角环绕）一致
+            if args.output_path is not None:
+                meta_dir = os.path.join(args.output_path, "meta")
+                os.makedirs(meta_dir, exist_ok=True)
+                nv_meta = max(
+                    1,
+                    int(args.num_render_views)
+                    if int(args.num_render_views) >= 0
+                    else int(args.num_views),
+                )
+                _mtw = {
+                    "rotation_matrices": [
+                        R.detach().cpu().numpy().tolist() for R in rotation_matrices
+                    ],
+                    "scale_origin": float(scale_origin.detach().cpu().item()),
+                    "original_mean_pos": original_mean_pos.detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(3)
+                    .tolist(),
+                }
+                write_stress_pcd_camera_meta_json(
+                    os.path.join(meta_dir, "stress_pcd_cameras.json"),
+                    viewpoint_center_worldspace=np.asarray(
+                        viewpoint_center_worldspace, dtype=np.float64
+                    ),
+                    observant_coordinates=np.asarray(
+                        observant_coordinates, dtype=np.float64
+                    ),
+                    num_views=nv_meta,
+                    init_azimuthm=float(camera_params["init_azimuthm"]),
+                    init_elevation=float(camera_params["init_elevation"]),
+                    init_radius=float(camera_params["init_radius"]),
+                    model_path=model_path,
+                    default_camera_index=int(
+                        camera_params.get("default_camera_index", -1)
+                    ),
+                    move_camera=bool(camera_params.get("move_camera", False)),
+                    delta_a=float(camera_params.get("delta_a", 0.0)),
+                    delta_e=float(camera_params.get("delta_e", 0.0)),
+                    delta_r=float(camera_params.get("delta_r", 0.0)),
+                    field_output_interval=int(args.field_output_interval),
+                    mpm_to_world=_mtw,
+                    mpm_space_viewpoint_center=list(
+                        camera_params["mpm_space_viewpoint_center"]
+                    ),
+                )
+
         # 若需要渲染，准备多视角的图像/视频输出目录
         image_root = None
         video_root = None
+        tracks_root = None
         if args.output_path is not None:
             if args.render_img:
                 image_root = os.path.join(args.output_path, "images")
@@ -564,24 +773,74 @@ if __name__ == "__main__":
             if args.render_img and args.compile_video:
                 video_root = os.path.join(args.output_path, "videos")
                 os.makedirs(video_root, exist_ok=True)
+            if want_tracks2d:
+                tracks_root = os.path.join(args.output_path, "tracks_2d")
+                os.makedirs(tracks_root, exist_ok=True)
 
-        # 定义多视角：人为指定数量，方位角在 [0, 360) 上均匀分布，俯仰角固定为 config
-        views = []
-        view_dirs = []
-        if args.render_img and image_root is not None:
-            num_views = max(1, int(args.num_views))
+        need_view_pass = (
+            bool(args.render_img)
+            or bool(want_stress_heatmap)
+            or bool(want_tracks2d)
+        )
+
+        # 定义多视角：方位角在 [0, 360) 上均匀分布，俯仰角固定为 config
+        views: List[Tuple[float, float]] = []
+        view_dirs: List[Optional[str]] = []
+        stress_view_dirs: List[Optional[str]] = []
+        view_names: List[str] = []
+        if need_view_pass and args.output_path is not None:
+            nv_cfg = int(args.num_render_views)
+            num_views_eff = max(1, nv_cfg if nv_cfg >= 0 else int(args.num_views))
             az_base = camera_params["init_azimuthm"]
             el_base = camera_params["init_elevation"]
-            for k in range(num_views):
-                az = az_base + 360.0 * k / num_views
-                # 归一化到 [0, 360) 便于命名
+            for k in range(num_views_eff):
+                az = az_base + 360.0 * k / num_views_eff
                 az = az % 360.0
                 el = el_base
                 views.append((az, el))
                 name = f"az{int(round(az))}_el{int(round(el))}"
-                d = os.path.join(image_root, name)
-                os.makedirs(d, exist_ok=True)
-                view_dirs.append(d)
+                view_names.append(name)
+                if args.render_img and image_root is not None:
+                    d = os.path.join(image_root, name)
+                    os.makedirs(d, exist_ok=True)
+                    view_dirs.append(d)
+                else:
+                    view_dirs.append(None)
+                if want_stress_heatmap:
+                    sd = os.path.join(args.output_path, "stress_heatmaps", name)
+                    os.makedirs(sd, exist_ok=True)
+                    stress_view_dirs.append(sd)
+                else:
+                    stress_view_dirs.append(None)
+        else:
+            view_dirs = []
+            stress_view_dirs = []
+            view_names = []
+
+        track_buffers: List[Optional[Any]] = (
+            [None] * len(views) if want_tracks2d else []
+        )
+
+        def _match_means2d_to_P(screen_pts: torch.Tensor, n_points: int) -> torch.Tensor:
+            """means2D 与 means3D 行数对齐（补零行参与光栅化预处理）。"""
+            P = int(n_points)
+            sp = screen_pts
+            if sp.shape[0] == P:
+                return sp
+            if sp.shape[0] < P:
+                extra = P - sp.shape[0]
+                pad = torch.zeros(
+                    (extra, sp.shape[1]),
+                    device=sp.device,
+                    dtype=sp.dtype,
+                    requires_grad=True,
+                )
+                try:
+                    pad.retain_grad()
+                except Exception:
+                    pass
+                return torch.cat([sp, pad], dim=0)
+            return sp[:P]
 
         for frame in tqdm(range(frame_num)):
 
@@ -589,14 +848,20 @@ if __name__ == "__main__":
                 mpm_solver.p2g2p(frame, substep_dt, device=device)
 
             # 循环中输出场（按间隔）
-            if (frame + 1) % args.field_output_interval == 0:
+            if (eff_output_deformation or eff_output_stress_vol) and (
+                (frame + 1) % args.field_output_interval == 0
+            ):
+                if eff_output_stress_vol:
+                    mpm_solver.recompute_particle_stress_from_F_trial(
+                        float(substep_dt), device=device
+                    )
                 save_fields_for_frame(
                     mpm_solver,
                     frame_id=frame + 1,
                     deformation_dir=deformation_dir,
                     stress_dir=stress_dir,
-                    output_deformation=args.output_deformation,
-                    output_stress=args.output_stress,
+                    output_deformation=eff_output_deformation,
+                    output_stress=eff_output_stress_vol,
                 )
 
             # 循环中输出 ply / h5
@@ -609,7 +874,13 @@ if __name__ == "__main__":
                     save_to_h5=True,
                 )
 
-            if args.render_img and views:
+            if need_view_pass and views and frame in render_frame_set:
+                out_idx = frame_to_out_idx[int(frame)]
+                # 与 save_stress_field 一致的三维应力：g2p 已更新 F_trial，须先刷新 τ 再读
+                if want_stress_heatmap:
+                    mpm_solver.recompute_particle_stress_from_F_trial(
+                        float(substep_dt), device=device
+                    )
                 # 先导出当前粒子信息一次，供所有视角复用
                 pos_base = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
                 cov3D_base = mpm_solver.export_particle_cov_to_torch()
@@ -635,7 +906,11 @@ if __name__ == "__main__":
                     base_opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
                     base_shs = torch.cat([shs_render, unselected_shs], dim=0)
 
-                # 对每个视角分别渲染
+                P = int(pos_world.shape[0])
+                means2d_input = _match_means2d_to_P(init_screen_points, P)
+                extra_tail = max(0, P - gs_num)
+
+                # 对每个视角分别渲染 / 视角辅助
                 for v_idx, (az, el) in enumerate(views):
                     current_camera = get_camera_view(
                         model_path,
@@ -661,7 +936,7 @@ if __name__ == "__main__":
                     )
                     rendering, raddi = rasterize(
                         means3D=pos_world,
-                        means2D=init_screen_points,
+                        means2D=means2d_input,
                         shs=None,
                         colors_precomp=colors_precomp,
                         opacities=base_opacity,
@@ -669,17 +944,105 @@ if __name__ == "__main__":
                         rotations=None,
                         cov3D_precomp=cov3D_world,
                     )
-                    cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
-                    cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
                     if height is None or width is None:
-                        height = cv2_img.shape[0] // 2 * 2
-                        width = cv2_img.shape[1] // 2 * 2
+                        _tmp = rendering.permute(1, 2, 0).detach().cpu().numpy()
+                        _tmp = cv2.cvtColor(_tmp, cv2.COLOR_BGR2RGB)
+                        height = _tmp.shape[0] // 2 * 2
+                        width = _tmp.shape[1] // 2 * 2
 
-                    view_dir = view_dirs[v_idx]
-                    cv2.imwrite(
-                        os.path.join(view_dir, f"{frame:04d}.png"),
-                        255 * cv2_img,
-                    )
+                    if args.render_img and view_dirs[v_idx] is not None:
+                        cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
+                        cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+                        cv2.imwrite(
+                            os.path.join(view_dirs[v_idx], f"{out_idx:04d}.png"),
+                            255 * cv2_img,
+                        )
+
+                    if want_stress_heatmap and stress_view_dirs[v_idx] is not None:
+                        sv = stress_scalars_aligned_to_render_chain(
+                            mpm_solver, gs_num, extra_tail, pos_world.device
+                        )
+                        stress_np = sv.detach().cpu().numpy()
+                        heat_bgr = splat_stress_heatmap_bgr(
+                            means2d_input,
+                            raddi,
+                            stress_np,
+                            int(height),
+                            int(width),
+                        )
+                        cv2.imwrite(
+                            os.path.join(
+                                stress_view_dirs[v_idx], f"{out_idx:04d}.png"
+                            ),
+                            heat_bgr,
+                        )
+
+                    if want_tracks2d and tracks_root is not None:
+                        if track_buffers[v_idx] is None:
+                            track_buffers[v_idx] = ViewTrackBuffer(P)
+                        track_buffers[v_idx].append(
+                            int(frame),
+                            means2d_input,
+                            raddi,
+                            int(height),
+                            int(width),
+                        )
+
+        # 汇总运行参数（供数据集构建与复现）
+        if args.output_path is not None:
+            meta_dir = os.path.join(args.output_path, "meta")
+            os.makedirs(meta_dir, exist_ok=True)
+            nv_effective = len(views) if views else 0
+
+            def _json_safe_obj(o):
+                if isinstance(o, dict):
+                    return {str(k): _json_safe_obj(v) for k, v in o.items()}
+                if isinstance(o, list):
+                    return [_json_safe_obj(v) for v in o]
+                if isinstance(o, (np.floating, np.integer)):
+                    return o.item()
+                if isinstance(o, np.ndarray):
+                    return o.tolist()
+                return o
+
+            run_payload = {
+                "sim_type": args.sim_type,
+                "frame_num_simulated": int(frame_num),
+                "substep_dt": float(substep_dt),
+                "frame_dt": float(frame_dt),
+                "step_per_frame": int(step_per_frame),
+                "num_views_cli": int(args.num_views),
+                "num_render_views_cli": int(args.num_render_views),
+                "num_render_views_effective": int(nv_effective),
+                "num_render_timesteps_cli": int(args.num_render_timesteps),
+                "render_frame_indices": [int(x) for x in render_frame_indices],
+                "num_render_outputs": int(len(render_frame_indices)),
+                "render_img": bool(args.render_img),
+                "compile_video": bool(args.compile_video),
+                "output_view_stress_heatmap_requested": bool(
+                    args.output_view_stress_heatmap
+                ),
+                "output_view_stress_heatmap_effective": bool(want_stress_heatmap),
+                "output_view_tracks2d_requested": bool(args.output_view_tracks2d),
+                "output_view_tracks2d_effective": bool(want_tracks2d),
+                "view_stress_recompute_before_read": bool(want_stress_heatmap),
+                "output_deformation_volumetric": bool(eff_output_deformation),
+                "output_stress_volumetric": bool(eff_output_stress_vol),
+                "field_output_interval": int(args.field_output_interval),
+                "view_names": list(view_names),
+                "material_params": _json_safe_obj(material_params),
+                "time_params": _json_safe_obj(time_params),
+            }
+            write_run_parameters_json(
+                os.path.join(meta_dir, "run_parameters.json"), run_payload
+            )
+
+        # 写出各视角 2D 轨迹
+        if want_tracks2d and tracks_root is not None and views:
+            for v_idx, name in enumerate(view_names):
+                buf = track_buffers[v_idx]
+                if buf is not None:
+                    buf.save_npz(os.path.join(tracks_root, f"{name}.npz"))
 
         # 为每个视角分别合成视频，放在 videos 目录下
         if args.render_img and args.compile_video and video_root is not None and views:
@@ -690,32 +1053,34 @@ if __name__ == "__main__":
                     "[modified_simulation] 未找到 ffmpeg，无法合成视频。"
                     f"请先安装 ffmpeg，或只用 --render_img 输出图片。期望输出目录: {video_root}"
                 )
-                continue
-            for v_idx, (az, el) in enumerate(views):
-                view_dir = view_dirs[v_idx]
-                name = f"az{int(round(az))}_el{int(round(el))}"
-                out_path = os.path.join(video_root, f"{name}.mp4")
-                in_pattern = os.path.join(view_dir, "%04d.png")
-                cmd = [
-                    ffmpeg_bin,
-                    "-framerate",
-                    str(fps),
-                    "-i",
-                    in_pattern,
-                    "-c:v",
-                    "libx264",
-                    "-s",
-                    f"{width}x{height}",
-                    "-y",
-                    "-pix_fmt",
-                    "yuv420p",
-                    out_path,
-                ]
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                if proc.returncode != 0:
-                    print(f"[modified_simulation] ffmpeg 合成失败: {out_path}")
-                    print(f"[modified_simulation] cmd: {' '.join(cmd)}")
-                    if proc.stderr:
-                        print(proc.stderr)
-                else:
-                    print(f"[modified_simulation] 已输出视频: {out_path}")
+            else:
+                for v_idx, (az, el) in enumerate(views):
+                    view_dir = view_dirs[v_idx]
+                    if view_dir is None:
+                        continue
+                    name = f"az{int(round(az))}_el{int(round(el))}"
+                    out_path = os.path.join(video_root, f"{name}.mp4")
+                    in_pattern = os.path.join(view_dir, "%04d.png")
+                    cmd = [
+                        ffmpeg_bin,
+                        "-framerate",
+                        str(fps),
+                        "-i",
+                        in_pattern,
+                        "-c:v",
+                        "libx264",
+                        "-s",
+                        f"{width}x{height}",
+                        "-y",
+                        "-pix_fmt",
+                        "yuv420p",
+                        out_path,
+                    ]
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    if proc.returncode != 0:
+                        print(f"[modified_simulation] ffmpeg 合成失败: {out_path}")
+                        print(f"[modified_simulation] cmd: {' '.join(cmd)}")
+                        if proc.stderr:
+                            print(proc.stderr)
+                    else:
+                        print(f"[modified_simulation] 已输出视频: {out_path}")

@@ -4,7 +4,7 @@ import os
 import random
 import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     # 作为包运行: python -m vlm_benchmark.run_vlm_benchmark
@@ -18,65 +18,32 @@ ACTION_NAMES = ("bend", "drop", "press", "shear", "stretch")
 MATERIAL_CATEGORIES = ("jelly", "metal", "plasticine")
 
 
-def _parse_params_to_dict(params_str: str) -> Dict[str, str]:
-    """
-    将 E=1.62e+04_density=1.28e+03_... 解析为 {key: value}，兼容 key 中含下划线（如 yield_stress）。
-    """
-    if not params_str.strip():
-        return {}
-    tokens = params_str.split("_")
-    result: Dict[str, str] = {}
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if "=" in t:
-            k, _, v = t.partition("=")
-            result[k] = v
-            i += 1
-        else:
-            if i + 1 < len(tokens):
-                nxt = tokens[i + 1]
-                if "=" not in nxt:
-                    result[t] = nxt
-                    i += 2
-                else:
-                    k2, _, v2 = nxt.partition("=")
-                    full_key = f"{t}_{k2}"
-                    result[full_key] = v2
-                    i += 2
-            else:
-                i += 1
-    return result
-
-
-def _iter_auto_output_runs(auto_output_root: Path) -> Iterable[Tuple[str, Path, Dict[str, str]]]:
-    """
-    遍历 auto_output/<action>/<OBJECT__PARAMS__action>/ 结构。
-    返回 (action, run_dir, params_dict)。
-    """
-    for action in ACTION_NAMES:
-        action_dir = auto_output_root / action
-        if not action_dir.is_dir():
-            continue
-        for run_dir in action_dir.iterdir():
-            if not run_dir.is_dir():
-                continue
-            name = run_dir.name
-            if "__" not in name:
-                continue
-            segs = name.split("__")
-            if len(segs) < 3:
-                continue
-            params_str = "__".join(segs[1:-1])
-            params = _parse_params_to_dict(params_str)
-            yield action, run_dir, params
-
-
 def _collect_all_runs(auto_output_root: Path) -> List[Tuple[str, Path, Dict[str, str]]]:
-    runs: List[Tuple[str, Path, Dict[str, str]]] = []
-    for item in _iter_auto_output_runs(auto_output_root):
-        runs.append(item)
-    return runs
+    """与 `my_model.dataset.iter_auto_output_runs` 一致：支持旧 `__` 目录名与数字目录 + gt_parameters.json。"""
+    import sys
+
+    root = auto_output_root.resolve()
+    pg_root = root.parent
+    if str(pg_root) not in sys.path:
+        sys.path.insert(0, str(pg_root))
+    from my_model.dataset import iter_auto_output_runs
+
+    return list(iter_auto_output_runs(auto_output_root))
+
+
+def _object_name_for_sample(run_dir: Path) -> str:
+    gt_path = run_dir / "gt_parameters.json"
+    if gt_path.is_file():
+        try:
+            with open(gt_path, "r", encoding="utf-8") as f:
+                gt = json.load(f)
+            return str(gt.get("ply_stem", run_dir.parent.name))
+        except (OSError, json.JSONDecodeError):
+            pass
+    name = run_dir.name
+    if "__" in name:
+        return name.split("__")[0]
+    return run_dir.parent.name
 
 
 def _find_video_in_run_dir(run_dir: Path) -> Optional[Path]:
@@ -197,7 +164,7 @@ def run_benchmark(
             yield_stress_gt = _safe_float(params, "yield_stress")
 
             # 样本 ID：物体名称 + 全局编号
-            object_name = run_dir.name.split("__")[0]
+            object_name = _object_name_for_sample(run_dir)
             sample_id = f"{object_name}_{num_processed + 1:04d}"
 
             # random_sample 模式：复制本次采样到的视频到 output/<vlm_tag>/sampled_videos/

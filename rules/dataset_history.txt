@@ -1,0 +1,72 @@
+[2026-03-20] 完整数据集流水线示例：`configs_auto/train_config_dataset_full.json`、`scripts/run_dataset_pipeline_full.sh`、`rules/dataset_output_pipeline.md`（train_config / transform_dataset 全参数说明）。
+
+[2026-03-20] 数据集含应力热力图与体积场：
+   - `modified_simulation`：默认启用视角应力热力图（`_VIEW_STRESS_HEATMAP_TEMP_DISABLED=False`）；`--output_view_stress_heatmap` + `render_img` 时写入 `stress_heatmaps/<az*_el*>/*.png`，与 RGB 同相机、同 `out_idx`；不依赖事先写出 `stress_field/`（运行时从粒子应力 recompute 后 splat）。
+   - 体积应力/形变：`train_config` 中 `output_stress` / `output_deformation`，`transform_dataset.py --copy_volumetric_fields` 复制 `stress_field/`、`deformation_field/` 到扁平样本目录。
+
+[2026-03-18] auto_simulation_runner 输出目录改为「每物体下四位数字样本目录」+ `gt_parameters.json`
+   - by_model：`output_root/<ply_stem>/0000/`、`0001/`、…（按该物体任务出现顺序递增，与全局 job 顺序一致）。
+   - by_action：`output_root/<sim_type>/<ply_stem>/0000/`、…
+   - 启动仿真前写入 `gt_parameters.json`（material_params、sim_type、ply_stem、job_index、output_layout）。
+   - `modified_simulation.py` 新增 `--ply_flat_output`，与 runner 配合使 `images/`、`meta/` 直接在 `<NNNN>/` 下。
+   - `transform_dataset.py`、`my_model/dataset.py`、`analyze_auto_output_params.py`、`combine_auto_output_videos.py` 已支持新布局，并保留对旧 `obj__params__action` 目录的兼容。
+
+[2026-03-18] 粒子填充缓存（particle filling cache）
+   - 开启 particle_filling 且未加 --no_filling_cache 时：fill_particles 完成后写入
+     `<model_root>/filled/<ply_stem>/`（--ply_path/--ply_dir）或
+     `<model_root>/filled/checkpoint_iter_<N>/`（--model_path checkpoint）。
+   - 文件：`mpm_init_pos.pt` + `filling_meta.json`（fingerprint、gs_num_surface、cache_version）。
+   - 命中条件：fingerprint 一致且表面粒子数 gs_num 一致；fingerprint 含源 PLY 的 size+mtime、
+     opacity_threshold、旋转/scale/sim_area、material grid_lim/n_grid、完整 filling 参数字典、
+     以及 PLY 模式特有的 x90 预处理标记（与 checkpoint 区分）。
+   - 修改 PLY 或 config 后一般会自动失效；若仅内容变而 mtime 未变，可用 --no_filling_cache 或删对应 filled 子目录。
+   - 实现：my_utils/filling_cache.py；modified_simulation.py / gs_simulation.py。
+
+[2026-03-18] 数据集生成扩展（见 rules/dataset_task.txt）
+
+1) modified_simulation.py
+   - 新增 CLI：--num_render_views（默认 -1 使用 --num_views）、--num_render_timesteps（0=每仿真帧输出）、
+     --output_view_stress_heatmap、--output_view_tracks2d、--no_volumetric_stress_deformation。
+   - 在仿真时间轴上按 num_render_timesteps 均匀选取输出时刻；RGB/应力热力图/2D 轨迹使用同一输出序号 out_idx（0000..K-1）。
+   - 应力：对每个视角将 von Mises（Cauchy）标量 splat 为 2D 热力图，可见性由 Gaussian 光栅 radii>0 与屏幕范围决定，不写三维应力体。
+   - 形变轨迹：每视角一个 npz，记录各输出时刻粒子在屏幕上的 UV（不可见为 nan）及 sim_frames。
+   - means2D 与 means3D 行数不一致时自动补零对齐（修复 sim_area 拼接未选中高斯时可能的维度问题）。
+   - meta/run_parameters.json：汇总 material_params、time_params、渲染索引与开关。
+   - 修复 ffmpeg 分支错误使用 continue 跳出任务循环的问题，改为 else 包裹合成逻辑。
+
+2) my_utils/view_auxiliary_output.py
+   - 渲染帧索引计算、Cauchy/von Mises、热力图 splat、轨迹缓冲与 npz 写出。
+
+3) auto_simulation_runner.py
+   - Job 与 train_config 支持：num_render_views、num_render_timesteps、output_view_stress_heatmap、
+     output_view_tracks2d、no_volumetric_stress_deformation，并透传给 modified_simulation。
+
+4) rules/dataset_task.txt / rules/dataset_history.txt
+   - 记录任务说明与变更历史（本文件）。
+
+[2026-03-18] 新增 `rules/auto_simulation_runner_guide.md`：`auto_simulation_runner` 完整使用说明（CLI、train_config / material_space 字段、输出布局、多卡、下游衔接与 FAQ）。
+
+[2026-03-18] auto_simulation_runner：默认 `output_layout=by_model`，输出
+   `auto_output/<物体>/<obj__params__action>/...`；`by_action` 恢复旧式按动作顶层目录。
+   transform_dataset / my_model.dataset.iter_auto_output_runs / analyze_auto_output_params /
+   combine_auto_output_videos 已支持扫描两种布局。
+
+[2026-03-18] transform_dataset.py
+   - 新增 `--layout by_model`：输出 `auto_output/<out_name>/<model>/<idx>/`，单样本格式同 dataset_400；`--out_name` 可指定如 dataset_full_test。
+   - 新增 `--copy_aux`：顺带复制 run_parameters.json、stress_heatmaps/、tracks_2d/（若存在）。
+   - train_test 布局逻辑抽成 emit_train_test_layout；manifest 增加 layout、out_name、source_auto_output。
+
+[2026-03-18] 应力热力图 / 体积 stress 导出：每子步 g2p 会更新 F_trial，而 particle_stress 仍为本子步初由旧 F_trial 算出的值；在关键帧读 Cauchy/von Mises 前须调用
+   `MPM_Simulator_WARP.recompute_particle_stress_from_F_trial(substep_dt)`（与同步子步开头的应力核一致）。
+   modified_simulation：渲染采样帧、save_stress_field 间隔、以及初始 frame0 体积导出前均增加该刷新；view_auxiliary_output 文档说明调用约定。
+   tracks_2d：`_VIEW_TRACKS2D_TEMP_DISABLED=True` 时忽略 `--output_view_tracks2d`。
+   应力热力图：`_VIEW_STRESS_HEATMAP_TEMP_DISABLED=True`（默认）时忽略 `--output_view_stress_heatmap`，便于排查推理速度；与轨迹开关均在 modified_simulation.py 顶部。
+
+[2026-03-18] 现象：tqdm 长期停在 0/N、「No cameras.json」出现多次。
+   原因分析（非 bug）：
+   1) tqdm 按「整仿真帧」更新；0% 表示第 0 帧尚未结束。该帧内要先跑完 `step_per_frame = frame_dt/substep_dt` 次 MPM `p2g2p`，子步多时会很久。
+   2) 首帧首次调用会触发额外 CUDA/Warp 编译与显存预热（mpm_utils / mpm_solver 已部分加载，其余 kernel 仍可能首触编译）。
+   3) 若该帧落在渲染采样集合内，还有粒子导出、`compute_R_from_F`、以及 diff_gaussian_rasterization 首次前向（自定义 raster 编译），多视角时乘视角数。
+   4) PLY 批量模式下 `model_path` 为 ply 所在目录，通常无 COLMAP 的 cameras.json，走 synthetic 相机；原实现每个视角每次 `get_camera_view` 都 print，易误判为「卡在打印处」——打印本身几乎不占时。
+   缓解：减少 num_views、合理增大 substep_dt（保证稳定前提下）、用 num_render_timesteps 降低渲染次数；后续帧通常明显快于首帧。
+   代码：`utils/camera_view_utils.py` 对同一 model 目录仅打印一次 synthetic camera 提示。

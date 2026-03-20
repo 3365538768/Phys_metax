@@ -130,17 +130,31 @@ def _filter_material_params_for_type(material_type: str, params: Dict[str, Any])
     return out
 
 
+def _safe_model_dir_name(ply_stem: str) -> str:
+    """一级输出目录名：与 PLY 物体名一致，去掉路径不安全字符。"""
+    s = ply_stem.replace("/", "_").replace("\\", "_").strip()
+    if not s or s in (".", ".."):
+        return "unknown_object"
+    return s
+
+
 @dataclass(frozen=True)
 class Job:
     ply_path: str
     sim_type: str
     material_params: Dict[str, Any]
     output_root: str
+    output_layout: str  # by_model | by_action
     num_views: int
+    num_render_views: int  # -1 表示与 num_views 相同
+    num_render_timesteps: int  # 0 表示每仿真帧都输出渲染/视角辅助
     render_img: bool
     compile_video: bool
     output_deformation: bool
     output_stress: bool
+    output_view_stress_heatmap: bool
+    output_view_tracks2d: bool
+    no_volumetric_stress_deformation: bool
     field_output_interval: int
     output_bc_info: bool
     output_force_info: bool
@@ -159,11 +173,23 @@ def _build_job_list(
 
     # 输出根目录默认固定为 PhysGaussian/auto_output（相对本脚本目录）
     output_root = train_cfg.get("output_root", os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_output"))
+    # by_model：auto_output/<物体名>/<obj__params__action>/... ；by_action：auto_output/<action>/...
+    _ol = str(train_cfg.get("output_layout", "by_model")).strip().lower()
+    output_layout = _ol if _ol in ("by_model", "by_action") else "by_model"
     num_views = int(train_cfg.get("num_views", 1))
+    # 渲染视角数：默认同 num_views；可单独设 num_render_views（与 rules/dataset_task 对齐）
+    nr_v = train_cfg.get("num_render_views", None)
+    num_render_views = int(nr_v) if nr_v is not None else -1
+    num_render_timesteps = int(train_cfg.get("num_render_timesteps", 0))
     render_img = bool(train_cfg.get("render_img", True))
     compile_video = bool(train_cfg.get("compile_video", True))
     output_deformation = bool(train_cfg.get("output_deformation", False))
     output_stress = bool(train_cfg.get("output_stress", False))
+    output_view_stress_heatmap = bool(train_cfg.get("output_view_stress_heatmap", False))
+    output_view_tracks2d = bool(train_cfg.get("output_view_tracks2d", False))
+    no_volumetric_stress_deformation = bool(
+        train_cfg.get("no_volumetric_stress_deformation", False)
+    )
     field_output_interval = int(train_cfg.get("field_output_interval", 1))
     output_bc_info = bool(train_cfg.get("output_bc_info", True))
     output_force_info = bool(train_cfg.get("output_force_info", True))
@@ -199,11 +225,17 @@ def _build_job_list(
                 sim_type=sim_type,
                 material_params=sampled,
                 output_root=output_root,
+                output_layout=output_layout,
                 num_views=num_views,
+                num_render_views=num_render_views,
+                num_render_timesteps=num_render_timesteps,
                 render_img=render_img,
                 compile_video=compile_video,
                 output_deformation=output_deformation,
                 output_stress=output_stress,
+                output_view_stress_heatmap=output_view_stress_heatmap,
+                output_view_tracks2d=output_view_tracks2d,
+                no_volumetric_stress_deformation=no_volumetric_stress_deformation,
                 field_output_interval=field_output_interval,
                 output_bc_info=output_bc_info,
                 output_force_info=output_force_info,
@@ -232,24 +264,32 @@ def _make_run_config(
     return cfg
 
 
-def _job_output_dir(job: Job) -> str:
+def _job_output_dir(job: Job, sample_index_in_model: int) -> str:
+    """
+    每种 model 下用四位数字子目录 0000, 0001, … 物理参数写入该目录下的 gt_parameters.json。
+    - by_model:   <output_root>/<model_safe>/<NNNN>/
+    - by_action:  <output_root>/<sim_type>/<model_safe>/<NNNN>/
+    """
     ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
-    def _fmt(v: Any) -> str:
-        if isinstance(v, float):
-            # 统一科学计数法，避免超长
-            return f"{v:.3g}"
-        return str(v)
+    model_safe = _safe_model_dir_name(ply_stem)
+    sub = f"{int(sample_index_in_model):04d}"
+    if getattr(job, "output_layout", "by_model") == "by_action":
+        return os.path.join(job.output_root, job.sim_type, model_safe, sub)
+    return os.path.join(job.output_root, model_safe, sub)
 
-    # 物理参数串：按 key 排序，便于稳定命名
-    parts = []
-    for k in sorted(job.material_params.keys()):
-        parts.append(f"{k}={_fmt(job.material_params[k])}")
-    phys_tag = "_".join(parts)
-    phys_tag = phys_tag.replace(" ", "").replace("/", "_")
 
-    # 目录结构：auto_output/<sim_type>/<obj__phys__sim_type>/
-    folder_name = f"{ply_stem}__{phys_tag}__{job.sim_type}"
-    return os.path.join(job.output_root, job.sim_type, folder_name)
+def _write_gt_parameters_json(out_dir: str, job: Job, job_index: int) -> None:
+    """地面真值物理参数（与目录名解耦，便于下游读取）。"""
+    ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
+    payload = {
+        "ply_stem": ply_stem,
+        "ply_path": job.ply_path,
+        "sim_type": job.sim_type,
+        "material_params": dict(job.material_params),
+        "job_index": int(job_index),
+        "output_layout": job.output_layout,
+    }
+    _write_json(os.path.join(out_dir, "gt_parameters.json"), payload)
 
 
 def _run_one_job(
@@ -320,6 +360,20 @@ def run() -> None:
     if num_gpus < 1:
         num_gpus = 1
 
+    # 每种 model（及 by_action 下每种 model×动作）独立递增四位序号
+    per_key_next: Dict[Tuple[str, ...], int] = {}
+
+    def _next_sample_index(job: Job) -> int:
+        ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
+        model_safe = _safe_model_dir_name(ply_stem)
+        if job.output_layout == "by_action":
+            key = (job.sim_type, model_safe)
+        else:
+            key = (model_safe,)
+        n = per_key_next.get(key, 0)
+        per_key_next[key] = n + 1
+        return n
+
     # 为所有 job 生成配置并构建 cmd
     tasks: List[Tuple[int, Job, List[str], str]] = []
     for idx, job in enumerate(jobs):
@@ -328,7 +382,11 @@ def run() -> None:
         base_cfg = _read_json(base_cfg_by_sim[job.sim_type])
         run_cfg = _make_run_config(base_cfg, job.sim_type, job.material_params)
 
-        out_dir = _job_output_dir(job)
+        sample_idx = _next_sample_index(job)
+        out_dir = _job_output_dir(job, sample_idx)
+        os.makedirs(out_dir, exist_ok=True)
+        _write_gt_parameters_json(out_dir, job, idx)
+
         cfg_path = os.path.join(tmp_cfg_dir, f"{idx:06d}_{job.sim_type}.json")
         _write_json(cfg_path, run_cfg)
 
@@ -341,10 +399,15 @@ def run() -> None:
             cfg_path,
             "--output_path",
             out_dir,
+            "--ply_flat_output",
             "--sim_type",
             job.sim_type,
             "--num_views",
             str(job.num_views),
+            "--num_render_views",
+            str(job.num_render_views),
+            "--num_render_timesteps",
+            str(job.num_render_timesteps),
             "--field_output_interval",
             str(job.field_output_interval),
         ]
@@ -356,6 +419,12 @@ def run() -> None:
             cmd.append("--output_deformation")
         if job.output_stress:
             cmd.append("--output_stress")
+        if job.output_view_stress_heatmap:
+            cmd.append("--output_view_stress_heatmap")
+        if job.output_view_tracks2d:
+            cmd.append("--output_view_tracks2d")
+        if job.no_volumetric_stress_deformation:
+            cmd.append("--no_volumetric_stress_deformation")
         if job.output_bc_info:
             cmd.append("--output_bc_info")
         if job.output_force_info:

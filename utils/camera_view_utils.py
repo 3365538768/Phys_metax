@@ -5,6 +5,9 @@ import torch
 from scene.cameras import Camera as GSCamera
 from utils.graphics_utils import focal2fov
 
+# 避免每帧、每视角重复刷屏（PLY 批量模式通常无 cameras.json）
+_logged_synthetic_camera_model_paths: set = set()
+
 
 def generate_camera_rotation_matrix(camera_to_object, object_vertical_downward):
     camera_to_object = camera_to_object / np.linalg.norm(
@@ -115,8 +118,10 @@ def get_camera_view(
     # Fallback: 没有 cameras.json 时自动生成 synthetic camera
     # ==========================================================
     if not os.path.exists(cam_path):
-
-        print("No cameras.json found. Using synthetic camera.")
+        _mp = os.path.abspath(os.path.dirname(cam_path))
+        if _mp not in _logged_synthetic_camera_model_paths:
+            _logged_synthetic_camera_model_paths.add(_mp)
+            print("No cameras.json found. Using synthetic camera.")
 
         assert center_view_world_space is not None
         assert observant_coordinates is not None
