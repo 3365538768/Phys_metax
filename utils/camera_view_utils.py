@@ -105,8 +105,72 @@ def get_camera_view(
     delta_e=0,
     delta_r=0,
 ):
-    """Load one of the default cameras for the scene."""
+    """Load one of the default cameras for the scene.
+       If cameras.json does not exist, generate a synthetic orbit camera.
+    """
+
     cam_path = os.path.join(model_path, "cameras.json")
+
+    # ==========================================================
+    # Fallback: 没有 cameras.json 时自动生成 synthetic camera
+    # ==========================================================
+    if not os.path.exists(cam_path):
+
+        print("No cameras.json found. Using synthetic camera.")
+
+        assert center_view_world_space is not None
+        assert observant_coordinates is not None
+        assert init_azimuthm is not None
+        assert init_elevation is not None
+        assert init_radius is not None
+
+        if move_camera:
+            position, R = get_camera_position_and_rotation(
+                init_azimuthm + current_frame * delta_a,
+                init_elevation + current_frame * delta_e,
+                init_radius + current_frame * delta_r,
+                center_view_world_space,
+                observant_coordinates,
+            )
+        else:
+            position, R = get_camera_position_and_rotation(
+                init_azimuthm,
+                init_elevation,
+                init_radius,
+                center_view_world_space,
+                observant_coordinates,
+            )
+
+        tmp = np.zeros((4, 4))
+        tmp[:3, :3] = R
+        tmp[:3, 3] = position
+        tmp[3, 3] = 1
+
+        C2W = np.linalg.inv(tmp)
+        R = C2W[:3, :3].transpose()
+        T = C2W[:3, 3]
+
+        # 默认分辨率和焦距
+        width = 800
+        height = 800
+        fovx = np.deg2rad(60.0)
+        fovy = np.deg2rad(60.0)
+
+        return GSCamera(
+            colmap_id=0,
+            R=R,
+            T=T,
+            FoVx=fovx,
+            FoVy=fovy,
+            image=torch.zeros((3, height, width)),
+            gt_alpha_mask=None,
+            image_name="synthetic",
+            uid=0,
+        )
+
+    # ==========================================================
+    # 原始逻辑（完全保留）
+    # ==========================================================
     with open(cam_path) as f:
         data = json.load(f)
 
@@ -129,16 +193,13 @@ def get_camera_view(
             raw_camera = data[default_camera_index]
 
         else:
-            raw_camera = data[0]  # get data to be modified
+            raw_camera = data[0]
 
             assert init_azimuthm is not None
             assert init_elevation is not None
             assert init_radius is not None
 
             if move_camera:
-                assert delta_a is not None
-                assert delta_e is not None
-                assert delta_r is not None
                 position, R = get_camera_position_and_rotation(
                     init_azimuthm + current_frame * delta_a,
                     init_elevation + current_frame * delta_e,
@@ -154,6 +215,7 @@ def get_camera_view(
                     center_view_world_space,
                     observant_coordinates,
                 )
+
             raw_camera["rotation"] = R.tolist()
             raw_camera["position"] = position.tolist()
 
@@ -161,6 +223,7 @@ def get_camera_view(
         tmp[:3, :3] = raw_camera["rotation"]
         tmp[:3, 3] = raw_camera["position"]
         tmp[3, 3] = 1
+
         C2W = np.linalg.inv(tmp)
         R = C2W[:3, :3].transpose()
         T = C2W[:3, 3]
@@ -176,7 +239,7 @@ def get_camera_view(
             T=T,
             FoVx=fovx,
             FoVy=fovy,
-            image=torch.zeros((3, height, width)),  # fake
+            image=torch.zeros((3, height, width)),
             gt_alpha_mask=None,
             image_name="fake",
             uid=0,

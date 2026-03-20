@@ -1,6 +1,10 @@
 data
 .vscode
 output
+# 本地批量仿真输出（体积大，不上传）
+auto_output/
+# 训练权重（体积大，不上传；需要请用网盘或 Release）
+my_model/checkpoints/
 *.ply
 *.pyc
 *.png

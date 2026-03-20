@@ -309,6 +309,10 @@ def set_boundary_conditions(
             assert "start_time" in bc.keys()
             assert "end_time" in bc.keys()
 
+            size = None
+            if "size" in bc.keys():
+                size = bc["size"]
+
             mpm_solver.add_surface_collider(
                 point=bc["point"],
                 normal=bc["normal"],
@@ -316,6 +320,7 @@ def set_boundary_conditions(
                 friction=bc["friction"],
                 start_time=bc["start_time"],
                 end_time=bc["end_time"],
+                size=size,
             )
         elif bc["type"] == "release_particles_sequentially":
             assert "normal" in bc.keys()
@@ -350,6 +355,16 @@ def set_boundary_conditions(
                 translation_scale=bc["translation_scale"],
                 start_time=bc["start_time"],
                 end_time=bc["end_time"],
+            )
+        elif bc["type"] == "set_velocity_on_cuboid":
+            assert "point" in bc and "size" in bc and "velocity" in bc
+            mpm_solver.set_velocity_on_cuboid(
+                point=bc["point"],
+                size=bc["size"],
+                velocity=bc["velocity"],
+                start_time=bc.get("start_time", 0.0),
+                end_time=bc.get("end_time", 999.0),
+                reset=bc.get("reset", 0),
             )
 
         else:

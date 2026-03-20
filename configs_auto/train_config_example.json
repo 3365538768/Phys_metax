@@ -1,0 +1,28 @@
+{
+  "seed": 0,
+  "num_simulations": 500,
+  "sim_types": ["bend", "drop", "press", "shear", "stretch"],
+
+  "output_root": "auto_output",
+
+  "render_img": true,
+  "compile_video": true,
+  "num_views": 1,
+  "white_bg": false,
+  "debug": false,
+
+  "output_deformation": false,
+  "output_stress": false,
+  "field_output_interval": 1000,
+  "output_bc_info": true,
+  "output_force_info": false,
+
+  "base_config_by_sim_type": {
+    "press": "config/press_cube_jelly.json",
+    "drop": "config/drop_cube_jelly.json",
+    "shear": "config/shear_cube_jelly.json",
+    "stretch": "config/stretch_cube_jelly.json",
+    "bend": "config/bend_cube_jelly.json"
+  }
+}
+

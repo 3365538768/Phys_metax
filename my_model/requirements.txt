@@ -1,0 +1,5 @@
+# my_model 额外依赖（PhysGaussian 已有 numpy, opencv 等）
+torch>=2.0
+torchvision>=0.15
+matplotlib>=3.5
+pandas>=1.5

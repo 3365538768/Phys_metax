@@ -21,7 +21,7 @@ from diff_gaussian_rasterization import (
 from scene.cameras import Camera as GSCamera
 from gaussian_renderer import render, GaussianModel
 from utils.system_utils import searchForMaxIteration
-from utils.graphics_utils import focal2fov
+from utils.graphics_utils import focal2fov 
 
 # MPM dependencies
 from mpm_solver_warp.engine_utils import *
@@ -67,6 +67,7 @@ def load_checkpoint(model_path, sh_degree=3, iteration=-1):
     return gaussians
 
 
+        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
@@ -78,6 +79,7 @@ if __name__ == "__main__":
     parser.add_argument("--compile_video", action="store_true")
     parser.add_argument("--white_bg", action="store_true")
     parser.add_argument("--debug", action="store_true")
+
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -253,6 +255,7 @@ if __name__ == "__main__":
 
     mpm_solver.finalize_mu_lam()
 
+
     # camera setting
     mpm_space_viewpoint_center = (
         torch.tensor(camera_params["mpm_space_viewpoint_center"]).reshape((1, 3)).cuda()
@@ -295,6 +298,7 @@ if __name__ == "__main__":
     shs_render = shs
     height = None
     width = None
+   
     for frame in tqdm(range(frame_num)):
         current_camera = get_camera_view(
             model_path,
@@ -317,15 +321,8 @@ if __name__ == "__main__":
 
         for step in range(step_per_frame):
             mpm_solver.p2g2p(frame, substep_dt, device=device)
-
-        if args.output_ply or args.output_h5:
-            save_data_at_frame(
-                mpm_solver,
-                directory_to_save,
-                frame + 1,
-                save_to_ply=args.output_ply,
-                save_to_h5=args.output_h5,
-            )
+            
+       
 
         if args.render_img:
             pos = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)

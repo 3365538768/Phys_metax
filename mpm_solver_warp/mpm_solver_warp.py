@@ -139,6 +139,9 @@ class MPM_Simulator_WARP:
         self.particle_velocity_modifiers = []
         self.particle_velocity_modifier_params = []
 
+        # cached initial positions for displacement field export
+        self.initial_particle_x = None
+
     # the h5 file should store particle initial position and volume.
     def load_from_sampling(
         self, sampling_h5, n_grid=100, grid_lim=1.0, device="cuda:0"
@@ -186,6 +189,10 @@ class MPM_Simulator_WARP:
         self.mpm_state.particle_vol = wp.from_numpy(
             particle_volume, dtype=float, device=device
         )
+
+
+        # cache initial particle positions for displacement field
+        self.initial_particle_x = wp.to_torch(self.mpm_state.particle_x).clone()
 
         print("Particles initialized from sampling file.")
         print("Total particles: ", self.n_particles)
@@ -236,6 +243,9 @@ class MPM_Simulator_WARP:
             device=device,
         )
         # initial trial deformation gradient is set to identity
+
+                # cache initial particle positions for displacement field
+        self.initial_particle_x = wp.to_torch(self.mpm_state.particle_x).clone()
 
         print("Particles initialized from torch data.")
         print("Total particles: ", self.n_particles)
@@ -569,6 +579,85 @@ class MPM_Simulator_WARP:
         F_tensor = F_tensor.reshape(-1, 9)
         return F_tensor
 
+
+    def export_particle_F_trial_to_torch(self):
+        """Return F_trial as a torch tensor with shape (N, 3, 3)."""
+        F_trial = wp.to_torch(self.mpm_state.particle_F_trial)
+        return F_trial
+
+    def export_particle_stress_to_torch(self):
+        """Return Kirchhoff stress τ as a torch tensor with shape (N, 3, 3)."""
+        tau = wp.to_torch(self.mpm_state.particle_stress)
+        return tau
+
+    def export_displacement_to_torch(self):
+        """Return displacement u = x - x0 as torch tensor with shape (N, 3)."""
+        if self.initial_particle_x is None:
+            # fall back to treating current as initial
+            self.initial_particle_x = self.export_particle_x_to_torch().clone()
+        x = self.export_particle_x_to_torch()
+        return x - self.initial_particle_x
+
+    def save_deformation_field(
+        self,
+        frame_id: int,
+        save_dir: str,
+        include_F_trial: bool = True,
+    ):
+        """Save deformation-related fields to a standalone file per frame.
+
+        Output file: <save_dir>/deformation_frame_XXXX.npz
+        Contents (简化版，只保留 position):
+        - position: (N,3)
+        """
+        import os
+        import numpy as np
+
+        os.makedirs(save_dir, exist_ok=True)
+        pos = self.export_particle_x_to_torch().detach().cpu().numpy()
+
+        # 只保留位置字段
+        out = {"position": pos}
+
+        np.savez(os.path.join(save_dir, f"deformation_frame_{frame_id:04d}.npz"), **out)
+
+    def save_stress_field(
+        self,
+        frame_id: int,
+        save_dir: str,
+        use_F: str = "trial",
+        save_J: bool = True,
+    ):
+        """Save stress fields (Kirchhoff + Cauchy) to a standalone file per frame.
+
+        Output file: <save_dir>/stress_frame_XXXX.npz
+        Contents (简化版，只保留 stress_cauchy):
+        - stress_cauchy: (N,3,3)   Cauchy stress σ
+        Args:
+        use_F: 'trial' uses particle_F_trial; 'elastic' uses particle_F.
+        """
+        import os
+        import numpy as np
+        import torch
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        tau = self.export_particle_stress_to_torch()
+        if use_F == "elastic":
+            F = wp.to_torch(self.mpm_state.particle_F)
+        else:
+            F = self.export_particle_F_trial_to_torch()
+
+        J = torch.det(F).clamp_min(1e-12)
+        sigma = tau / J.view(-1, 1, 1)
+
+        # 只保留 Cauchy 应力
+        out = {
+            "stress_cauchy": sigma.detach().cpu().numpy(),
+        }
+
+        np.savez(os.path.join(save_dir, f"stress_frame_{frame_id:04d}.npz"), **out)
+
     def export_particle_R_to_torch(self, device="cuda:0"):
         with wp.ScopedTimer(
             "compute_R_from_F",
@@ -624,8 +713,11 @@ class MPM_Simulator_WARP:
         friction=0.0,
         start_time=0.0,
         end_time=999.0,
+        size=None,
     ):
+
         point = list(point)
+
         # Normalize normal
         normal_scale = 1.0 / wp.sqrt(float(sum(x**2 for x in normal)))
         normal = list(normal_scale * x for x in normal)
@@ -637,8 +729,16 @@ class MPM_Simulator_WARP:
         collider_param.point = wp.vec3(point[0], point[1], point[2])
         collider_param.normal = wp.vec3(normal[0], normal[1], normal[2])
 
+        # ---- 新增：桌面尺寸 ----
+        if size is None:
+            collider_param.size = wp.vec3(1e6, 1e6, 1e6) 
+        else:
+            collider_param.size = wp.vec3(size[0], size[1], 1e6)
+
+        # ---- surface type ----
         if surface == "sticky" and friction != 0:
             raise ValueError("friction must be 0 on sticky surfaces.")
+
         if surface == "sticky":
             collider_param.surface_type = 0
         elif surface == "slip":
@@ -647,7 +747,7 @@ class MPM_Simulator_WARP:
             collider_param.surface_type = 11
         else:
             collider_param.surface_type = 2
-        # frictional
+
         collider_param.friction = friction
 
         self.collider_params.append(collider_param)
@@ -661,53 +761,59 @@ class MPM_Simulator_WARP:
             param: Dirichlet_collider,
         ):
             grid_x, grid_y, grid_z = wp.tid()
+
             if time >= param.start_time and time < param.end_time:
+
+                # grid world position
+                gx = float(grid_x) * model.dx
+                gy = float(grid_y) * model.dx
+                gz = float(grid_z) * model.dx
+
                 offset = wp.vec3(
-                    float(grid_x) * model.dx - param.point[0],
-                    float(grid_y) * model.dx - param.point[1],
-                    float(grid_z) * model.dx - param.point[2],
+                    gx - param.point[0],
+                    gy - param.point[1],
+                    gz - param.point[2],
                 )
-                n = wp.vec3(param.normal[0], param.normal[1], param.normal[2])
+
+                n = param.normal
                 dotproduct = wp.dot(offset, n)
 
-                if dotproduct < 0.0:
+                # ---- 新增：限制桌面范围 ----
+                inside_table = (
+                    wp.abs(offset[0]) < param.size[0]
+                    and wp.abs(offset[1]) < param.size[1]
+                )
+
+                if dotproduct < 0.0 and inside_table:
+
                     if param.surface_type == 0:
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                            0.0, 0.0, 0.0
-                        )
+                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0,0.0,0.0)
+
                     elif param.surface_type == 11:
-                        if (
-                            float(grid_z) * model.dx < 0.4
-                            or float(grid_z) * model.dx > 0.53
-                        ):
-                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                                0.0, 0.0, 0.0
-                            )
+                        if gz < 0.4 or gz > 0.53:
+                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(0.0,0.0,0.0)
                         else:
                             v_in = state.grid_v_out[grid_x, grid_y, grid_z]
-                            state.grid_v_out[grid_x, grid_y, grid_z] = (
-                                wp.vec3(v_in[0], 0.0, v_in[2]) * 0.3
-                            )
+                            state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
+                                v_in[0], 0.0, v_in[2]
+                            ) * 0.3
+
                     else:
                         v = state.grid_v_out[grid_x, grid_y, grid_z]
                         normal_component = wp.dot(v, n)
+
                         if param.surface_type == 1:
-                            v = (
-                                v - normal_component * n
-                            )  # Project out all normal component
+                            v = v - normal_component * n
                         else:
-                            v = (
-                                v - wp.min(normal_component, 0.0) * n
-                            )  # Project out only inward normal component
+                            v = v - wp.min(normal_component, 0.0) * n
+
                         if normal_component < 0.0 and wp.length(v) > 1e-20:
                             v = wp.max(
-                                0.0, wp.length(v) + normal_component * param.friction
-                            ) * wp.normalize(
-                                v
-                            )  # apply friction here
-                        state.grid_v_out[grid_x, grid_y, grid_z] = wp.vec3(
-                            0.0, 0.0, 0.0
-                        )
+                                0.0,
+                                wp.length(v) + normal_component * param.friction
+                            ) * wp.normalize(v)
+
+                        state.grid_v_out[grid_x, grid_y, grid_z] = v
 
         self.grid_postprocess.append(collide)
         self.modify_bc.append(None)
@@ -1078,3 +1184,5 @@ class MPM_Simulator_WARP:
                 start_time=start_time,
                 end_time=end_time_portion * (i + 1),
             )
+
+
