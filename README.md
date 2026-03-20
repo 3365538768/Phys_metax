@@ -23,6 +23,8 @@ This repository uses original gaussian-splatting as a submodule. Use the followi
 git clone --recurse-submodules git@github.com:XPandora/PhysGaussian.git
 ```
 
+国内网络访问 GitHub 进行 `git push` / `git fetch` 时，可参考仓库内 **[GIT_PROXY.md](GIT_PROXY.md)** 配置 HTTP(S) 代理环境变量。
+
 ## Setup
 
 ### Python Environment
