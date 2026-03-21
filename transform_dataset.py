@@ -14,12 +14,15 @@
 auto_simulation_runner 原始输出（新）：
   auto_output/<model>/<NNNN>/（NNNN 为四位数字），物理参数见该目录下 gt_parameters.json；
   by_action 时为 auto_output/<action>/<model>/<NNNN>/。
+  命名数据集（train_config.dataset_name 非空）：
+  auto_output/<dataset_name>/[<split>/]<NNNNNN>/（六位），含 gt_parameters.json 与 gt.json；
+  采集时支持 <dataset>/<split>/ 下全为六位数字子目录的结构。
 
 每个样本目录包含：
   - images/          帧图片（展平到同一目录，按序命名 000000.png …）
   - boundary_conditions.json  （来自 meta/）
   - gt.json          从外层文件夹名解析的动作类型与物理参数 GT
-  可选（--copy_aux）：run_parameters.json、stress_heatmaps/（与 RGB 同视角、同输出序号）、tracks_2d/
+  可选（--copy_aux）：run_parameters.json、stress_heatmaps/、stress_gaussian/、flow_gaussian/、tracks_gaussian/、tracks_subsampled_world/
   可选（--copy_volumetric_fields）：stress_field/、deformation_field/（须仿真时开启 --output_stress / --output_deformation）
 
 划分规则（仅 layout=train_test）：
@@ -234,6 +237,27 @@ def _collect_samples_mult_inner(auto_output: Path) -> List[Tuple[Path, str, str,
                 params = _material_params_to_str_dict(gt.get("material_params"))
                 try_append(outer, action_from_name, object_slug, params)
                 continue
+            # auto_simulation_runner 命名数据集：auto_output/<dataset_name>/<split>/<NNNNNN>/
+            subdirs = [d for d in outer.iterdir() if d.is_dir()]
+            if subdirs and all(
+                d.name.isdigit() and len(d.name) == 6 for d in subdirs
+            ):
+                for inner in sorted(subdirs, key=lambda p: p.name):
+                    gt_path = inner / "gt_parameters.json"
+                    if not gt_path.is_file():
+                        continue
+                    try:
+                        with open(gt_path, "r", encoding="utf-8") as gf:
+                            gt = json.load(gf)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    action_from_name = str(gt.get("sim_type", ""))
+                    if action_from_name not in ACTION_NAMES:
+                        continue
+                    object_slug = str(gt.get("ply_stem", model_top.name))
+                    params = _material_params_to_str_dict(gt.get("material_params"))
+                    try_append(inner, action_from_name, object_slug, params)
+                continue
             parsed = parse_outer_folder(outer.name)
             if parsed is None:
                 continue
@@ -283,13 +307,19 @@ def safe_model_dir_name(object_slug: str) -> str:
 
 def copy_optional_auxiliary(inner: Path, dest: Path) -> None:
     """
-    若存在则复制：meta/run_parameters.json、stress_heatmaps/、tracks_2d/
-    （与 modified_simulation 扩展输出一致，便于与 dataset_400 式样本对齐存档）
+    若存在则复制：meta/run_parameters.json、stress_heatmaps/、stress_gaussian/、
+    flow_gaussian/、tracks_gaussian/、tracks_subsampled_world/（与 modified_simulation 扩展输出一致）
     """
     rp = inner / "meta" / "run_parameters.json"
     if rp.is_file():
         shutil.copy2(rp, dest / "run_parameters.json")
-    for name in ("stress_heatmaps", "tracks_2d"):
+    for name in (
+        "stress_heatmaps",
+        "stress_gaussian",
+        "flow_gaussian",
+        "tracks_gaussian",
+        "tracks_subsampled_world",
+    ):
         src = inner / name
         if src.is_dir():
             dst = dest / name
@@ -490,7 +520,7 @@ def main() -> None:
     parser.add_argument(
         "--copy_aux",
         action="store_true",
-        help="额外复制 meta/run_parameters.json 及 stress_heatmaps/、tracks_2d/（若存在）",
+        help="额外复制 run_parameters.json 及 stress_heatmaps/、stress_gaussian/、flow_gaussian/、tracks_gaussian/、tracks_subsampled_world/（若存在）",
     )
     parser.add_argument(
         "--copy_volumetric_fields",

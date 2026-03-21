@@ -5,9 +5,94 @@ import random
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 import itertools
 from typing import Any, Dict, List, Optional, Tuple
+
+from tqdm import tqdm
+
+
+def _nvidia_smi_gpu_states() -> Optional[List[Tuple[int, int, int]]]:
+    """
+    查询各物理 GPU 的 index、空闲显存与利用率（动态占卡仅使用利用率）。
+    返回 [(index, memory_free_mib, utilization_gpu_pct), ...]；失败返回 None。
+    """
+    try:
+        result = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+        lines = result.decode("utf-8").strip().split("\n")
+        out: List[Tuple[int, int, int]] = []
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 3:
+                continue
+            out.append((int(parts[0]), int(parts[1]), int(parts[2])))
+        return out if out else None
+    except Exception:
+        return None
+
+
+def _all_schedulable_physical_gpu_ids(torch_device_count: int) -> List[int]:
+    """
+    本机可参与调度的全部物理 GPU 编号（与 nvidia-smi index 一致）。
+    不在此列表截断：--num_gpus 表示「最多同时跑几个任务」，而不是「只用前 N 张卡」，
+    否则会出现在 GPU0–2 挤爆时无法去占 GPU5/7 上大量空闲显存的情况。
+    若已设置 CUDA_VISIBLE_DEVICES，则仅使用其中的编号（逗号分隔整数）。
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if raw:
+        ids: List[int] = []
+        for p in raw.split(","):
+            p = p.strip()
+            if not p:
+                continue
+            try:
+                ids.append(int(p))
+            except ValueError:
+                continue
+        return ids
+    states = _nvidia_smi_gpu_states()
+    if states:
+        return [s[0] for s in states]
+    n = max(int(torch_device_count), 1)
+    return list(range(n))
+
+
+def _physical_gpu_looks_idle(
+    gpu_id: int,
+    states: Optional[List[Tuple[int, int, int]]],
+    max_util_pct: int,
+    min_free_mib: int,
+    *,
+    relax_util_when_free_mib: int,
+    smi_failed_assume_idle: bool,
+) -> bool:
+    """
+    是否可占卡：须满足显存下限；利用率一般须 ≤max_util_pct。
+    若剩余显存 ≥ relax_util_when_free_mib（如 40GiB 级），则不再卡利用率——
+    适用于 MPS/多进程共享显存、他人在跑算力但仍有大块空闲显存的 A800。
+    min_free_mib==0 时不检查显存下限（不推荐）。
+    """
+    if states is None:
+        return smi_failed_assume_idle
+    for g, free_mib, util in states:
+        if g == gpu_id:
+            mem_ok = int(min_free_mib) <= 0 or free_mib >= int(min_free_mib)
+            if not mem_ok:
+                return False
+            relax = int(relax_util_when_free_mib)
+            if relax > 0 and free_mib >= relax:
+                return True
+            return util <= max_util_pct
+    return False
 
 
 def _read_json(path: str) -> Dict[str, Any]:
@@ -138,6 +223,14 @@ def _safe_model_dir_name(ply_stem: str) -> str:
     return s
 
 
+def _safe_dataset_segment(name: str, kind: str = "dataset") -> str:
+    """数据集名或 split 子目录（如 train），禁止路径穿越。"""
+    s = str(name).replace("/", "_").replace("\\", "_").strip()
+    if not s or s in (".", ".."):
+        raise ValueError(f"非法{kind}目录名: {name!r}（需非空且非 . / ..）")
+    return s
+
+
 @dataclass(frozen=True)
 class Job:
     ply_path: str
@@ -148,18 +241,49 @@ class Job:
     num_views: int
     num_render_views: int  # -1 表示与 num_views 相同
     num_render_timesteps: int  # 0 表示每仿真帧都输出渲染/视角辅助
+    render_outputs_per_sim_second: float  # >0 时覆盖为「每秒仿真时长 N 张」均匀采样 + 视频帧率
     render_img: bool
     compile_video: bool
+    delete_png_sequences_after_compile_video: bool
     output_deformation: bool
     output_stress: bool
     output_view_stress_heatmap: bool
-    output_view_tracks2d: bool
+    output_view_stress_gaussian: bool
+    stress_gaussian_colormap_steps: int
+    stress_gaussian_vm_pct_low: float
+    stress_gaussian_vm_pct_high: float
+    output_view_flow_gaussian: bool
+    flow_gaussian_max_gaussians: int
+    flow_gaussian_seed: int
+    flow_gaussian_depth_gamma: float
+    flow_gaussian_depth_eps: float
+    flow_gaussian_opacity_power: float
+    flow_gaussian_vis_max_motion: float
+    output_view_tracks_gaussian: bool
+    tracks_gaussian_max_tracks: int
+    tracks_gaussian_sigma_scale: float
+    tracks_gaussian_point_opacity: float
+    tracks_gaussian_intensity: float
+    tracks_gaussian_seed: int
+    tracks_gaussian_accum_mode: str
+    tracks_gaussian_accum_frame_weight: float
+    tracks_gaussian_accum_decay: float
+    tracks_gaussian_accum_midpoint: bool
+    tracks_gaussian_accum_no_normalize_save: bool
+    output_subsampled_world_tracks: bool
+    subsampled_tracks_num: int
+    subsampled_tracks_seed: int
+    subsampled_tracks_ortho_axes: str
+    subsampled_tracks_video_size: int
     no_volumetric_stress_deformation: bool
     field_output_interval: int
     output_bc_info: bool
     output_force_info: bool
     white_bg: bool
     debug: bool
+    # 非 None 时：样本写到 output_root/dataset_name/[dataset_split]/000000/（6 位），并写 gt.json
+    dataset_name: Optional[str]
+    dataset_split: str  # 空字符串表示不再套一层子目录（仅 output_root/dataset_name/000000/）
 
 
 def _build_job_list(
@@ -176,17 +300,112 @@ def _build_job_list(
     # by_model：auto_output/<物体名>/<obj__params__action>/... ；by_action：auto_output/<action>/...
     _ol = str(train_cfg.get("output_layout", "by_model")).strip().lower()
     output_layout = _ol if _ol in ("by_model", "by_action") else "by_model"
+    _dn_raw = train_cfg.get("dataset_name", None)
+    if _dn_raw is None:
+        dataset_name: Optional[str] = None
+    else:
+        _dn = str(_dn_raw).strip()
+        dataset_name = _dn if _dn else None
+    _ds_raw = train_cfg.get("dataset_split", "train")
+    dataset_split = str(_ds_raw).strip() if _ds_raw is not None else ""
     num_views = int(train_cfg.get("num_views", 1))
     # 渲染视角数：默认同 num_views；可单独设 num_render_views（与 rules/dataset_task 对齐）
     nr_v = train_cfg.get("num_render_views", None)
     num_render_views = int(nr_v) if nr_v is not None else -1
     num_render_timesteps = int(train_cfg.get("num_render_timesteps", 0))
+    render_outputs_per_sim_second = float(
+        train_cfg.get("render_outputs_per_sim_second", 0.0) or 0.0
+    )
     render_img = bool(train_cfg.get("render_img", True))
-    compile_video = bool(train_cfg.get("compile_video", True))
+    # 统一控制：有 PNG 后是否用 ffmpeg 合成 mp4（images/、stress_gaussian/、tracks_gaussian/、flow_gaussian/；另含 subsampled 正交轨迹 mp4）
+    if "compile_multiview_videos" in train_cfg:
+        compile_video = bool(train_cfg["compile_multiview_videos"])
+    else:
+        compile_video = bool(train_cfg.get("compile_video", True))
+    delete_png_sequences_after_compile_video = bool(
+        train_cfg.get("delete_png_sequences_after_compile_video", False)
+    )
     output_deformation = bool(train_cfg.get("output_deformation", False))
     output_stress = bool(train_cfg.get("output_stress", False))
     output_view_stress_heatmap = bool(train_cfg.get("output_view_stress_heatmap", False))
-    output_view_tracks2d = bool(train_cfg.get("output_view_tracks2d", False))
+    output_view_stress_gaussian = bool(
+        train_cfg.get("output_view_stress_gaussian", False)
+    )
+    stress_gaussian_colormap_steps = int(
+        train_cfg.get("stress_gaussian_colormap_steps", 24)
+    )
+    stress_gaussian_vm_pct_low = float(
+        train_cfg.get(
+            "stress_gaussian_vm_pct_low",
+            train_cfg.get("stress_gaussian_log_pct_low", 1.0),
+        )
+    )
+    stress_gaussian_vm_pct_high = float(
+        train_cfg.get(
+            "stress_gaussian_vm_pct_high",
+            train_cfg.get("stress_gaussian_log_pct_high", 99.0),
+        )
+    )
+    output_view_flow_gaussian = bool(
+        train_cfg.get("output_view_flow_gaussian", False)
+    )
+    flow_gaussian_max_gaussians = int(
+        train_cfg.get("flow_gaussian_max_gaussians", 8192)
+    )
+    flow_gaussian_seed = int(train_cfg.get("flow_gaussian_seed", 0))
+    flow_gaussian_depth_gamma = float(
+        train_cfg.get("flow_gaussian_depth_gamma", 1.0)
+    )
+    flow_gaussian_depth_eps = float(
+        train_cfg.get("flow_gaussian_depth_eps", 1e-2)
+    )
+    flow_gaussian_opacity_power = float(
+        train_cfg.get("flow_gaussian_opacity_power", 1.0)
+    )
+    flow_gaussian_vis_max_motion = float(
+        train_cfg.get("flow_gaussian_vis_max_motion", 0.0)
+    )
+    output_view_tracks_gaussian = bool(
+        train_cfg.get("output_view_tracks_gaussian", False)
+    )
+    tracks_gaussian_max_tracks = int(train_cfg.get("tracks_gaussian_max_tracks", 2048))
+    tracks_gaussian_sigma_scale = float(
+        train_cfg.get("tracks_gaussian_sigma_scale", 0.0012)
+    )
+    tracks_gaussian_point_opacity = float(
+        train_cfg.get("tracks_gaussian_point_opacity", 1.0)
+    )
+    tracks_gaussian_point_opacity = max(
+        0.01, min(1.0, tracks_gaussian_point_opacity)
+    )
+    tracks_gaussian_intensity = float(
+        train_cfg.get("tracks_gaussian_intensity", 1.0)
+    )
+    tracks_gaussian_seed = int(train_cfg.get("tracks_gaussian_seed", 0))
+    _tgm = str(train_cfg.get("tracks_gaussian_accum_mode", "max")).strip().lower()
+    tracks_gaussian_accum_mode = _tgm if _tgm in ("max", "add") else "max"
+    tracks_gaussian_accum_frame_weight = float(
+        train_cfg.get("tracks_gaussian_accum_frame_weight", 1.0)
+    )
+    tracks_gaussian_accum_decay = float(
+        train_cfg.get("tracks_gaussian_accum_decay", 1.0)
+    )
+    tracks_gaussian_accum_midpoint = bool(
+        train_cfg.get("tracks_gaussian_accum_midpoint", False)
+    )
+    tracks_gaussian_accum_no_normalize_save = bool(
+        train_cfg.get("tracks_gaussian_accum_no_normalize_save", False)
+    )
+    output_subsampled_world_tracks = bool(
+        train_cfg.get("output_subsampled_world_tracks", False)
+    )
+    subsampled_tracks_num = int(train_cfg.get("subsampled_tracks_num", 1024))
+    subsampled_tracks_seed = int(train_cfg.get("subsampled_tracks_seed", 0))
+    _sa = str(train_cfg.get("subsampled_tracks_ortho_axes", "xz")).strip().lower()
+    subsampled_tracks_ortho_axes = _sa if _sa in ("xy", "xz", "yz") else "xz"
+    subsampled_tracks_video_size = max(
+        32, int(train_cfg.get("subsampled_tracks_video_size", 512))
+    )
     no_volumetric_stress_deformation = bool(
         train_cfg.get("no_volumetric_stress_deformation", False)
     )
@@ -229,18 +448,48 @@ def _build_job_list(
                 num_views=num_views,
                 num_render_views=num_render_views,
                 num_render_timesteps=num_render_timesteps,
+                render_outputs_per_sim_second=render_outputs_per_sim_second,
                 render_img=render_img,
                 compile_video=compile_video,
+                delete_png_sequences_after_compile_video=delete_png_sequences_after_compile_video,
                 output_deformation=output_deformation,
                 output_stress=output_stress,
                 output_view_stress_heatmap=output_view_stress_heatmap,
-                output_view_tracks2d=output_view_tracks2d,
+                output_view_stress_gaussian=output_view_stress_gaussian,
+                stress_gaussian_colormap_steps=stress_gaussian_colormap_steps,
+                stress_gaussian_vm_pct_low=stress_gaussian_vm_pct_low,
+                stress_gaussian_vm_pct_high=stress_gaussian_vm_pct_high,
+                output_view_flow_gaussian=output_view_flow_gaussian,
+                flow_gaussian_max_gaussians=flow_gaussian_max_gaussians,
+                flow_gaussian_seed=flow_gaussian_seed,
+                flow_gaussian_depth_gamma=flow_gaussian_depth_gamma,
+                flow_gaussian_depth_eps=flow_gaussian_depth_eps,
+                flow_gaussian_opacity_power=flow_gaussian_opacity_power,
+                flow_gaussian_vis_max_motion=flow_gaussian_vis_max_motion,
+                output_view_tracks_gaussian=output_view_tracks_gaussian,
+                tracks_gaussian_max_tracks=tracks_gaussian_max_tracks,
+                tracks_gaussian_sigma_scale=tracks_gaussian_sigma_scale,
+                tracks_gaussian_point_opacity=tracks_gaussian_point_opacity,
+                tracks_gaussian_intensity=tracks_gaussian_intensity,
+                tracks_gaussian_seed=tracks_gaussian_seed,
+                tracks_gaussian_accum_mode=tracks_gaussian_accum_mode,
+                tracks_gaussian_accum_frame_weight=tracks_gaussian_accum_frame_weight,
+                tracks_gaussian_accum_decay=tracks_gaussian_accum_decay,
+                tracks_gaussian_accum_midpoint=tracks_gaussian_accum_midpoint,
+                tracks_gaussian_accum_no_normalize_save=tracks_gaussian_accum_no_normalize_save,
+                output_subsampled_world_tracks=output_subsampled_world_tracks,
+                subsampled_tracks_num=subsampled_tracks_num,
+                subsampled_tracks_seed=subsampled_tracks_seed,
+                subsampled_tracks_ortho_axes=subsampled_tracks_ortho_axes,
+                subsampled_tracks_video_size=subsampled_tracks_video_size,
                 no_volumetric_stress_deformation=no_volumetric_stress_deformation,
                 field_output_interval=field_output_interval,
                 output_bc_info=output_bc_info,
                 output_force_info=output_force_info,
                 white_bg=white_bg,
                 debug=debug,
+                dataset_name=dataset_name,
+                dataset_split=dataset_split,
             )
         )
 
@@ -264,21 +513,38 @@ def _make_run_config(
     return cfg
 
 
-def _job_output_dir(job: Job, sample_index_in_model: int) -> str:
+def _job_output_dir(job: Job, sample_index: int) -> str:
     """
-    每种 model 下用四位数字子目录 0000, 0001, … 物理参数写入该目录下的 gt_parameters.json。
+    命名数据集（job.dataset_name 非空）：
+      <output_root>/<dataset_name>/[<dataset_split>/]<000000>/  （6 位全局序号，与 dataset_400 一致）
+    否则（每种 model 四位序号）：
     - by_model:   <output_root>/<model_safe>/<NNNN>/
     - by_action:  <output_root>/<sim_type>/<model_safe>/<NNNN>/
     """
+    if getattr(job, "dataset_name", None):
+        ds_name = _safe_dataset_segment(job.dataset_name, kind="数据集")
+        parts = [job.output_root, ds_name]
+        split = (getattr(job, "dataset_split", "") or "").strip()
+        if split:
+            parts.append(_safe_dataset_segment(split, kind="split"))
+        parts.append(f"{int(sample_index):06d}")
+        return os.path.join(*parts)
+
     ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
     model_safe = _safe_model_dir_name(ply_stem)
-    sub = f"{int(sample_index_in_model):04d}"
+    sub = f"{int(sample_index):04d}"
     if getattr(job, "output_layout", "by_model") == "by_action":
         return os.path.join(job.output_root, job.sim_type, model_safe, sub)
     return os.path.join(job.output_root, model_safe, sub)
 
 
-def _write_gt_parameters_json(out_dir: str, job: Job, job_index: int) -> None:
+def _write_gt_parameters_json(
+    out_dir: str,
+    job: Job,
+    job_index: int,
+    *,
+    sample_index_for_output: int,
+) -> None:
     """地面真值物理参数（与目录名解耦，便于下游读取）。"""
     ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
     payload = {
@@ -288,8 +554,44 @@ def _write_gt_parameters_json(out_dir: str, job: Job, job_index: int) -> None:
         "material_params": dict(job.material_params),
         "job_index": int(job_index),
         "output_layout": job.output_layout,
+        "sample_index": int(sample_index_for_output),
+        "folder_digits": 6 if getattr(job, "dataset_name", None) else 4,
     }
+    if getattr(job, "dataset_name", None):
+        payload["dataset_name"] = job.dataset_name
+        payload["dataset_split"] = (job.dataset_split or "").strip()
     _write_json(os.path.join(out_dir, "gt_parameters.json"), payload)
+
+
+def _material_params_to_str_dict(mp: Dict[str, Any]) -> Dict[str, str]:
+    return {str(k): str(v) for k, v in mp.items()}
+
+
+def _write_gt_json_dataset_layout(
+    out_dir: str,
+    job: Job,
+    job_index: int,
+    sample_index: int,
+    *,
+    train_seed: int,
+) -> None:
+    """
+    与 transform_dataset 产出的 dataset_400/train/000000/gt.json 字段对齐，
+    并附加 dataset 元信息，便于后续划分 train/test 或统一训练。
+    """
+    from transform_dataset import build_gt_json
+
+    ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
+    params_str = _material_params_to_str_dict(job.material_params)
+    gt: Dict[str, Any] = build_gt_json(ply_stem, job.sim_type, params_str)
+    gt["sample_index"] = int(sample_index)
+    gt["job_index"] = int(job_index)
+    gt["train_seed"] = int(train_seed)
+    gt["dataset_name"] = job.dataset_name
+    gt["dataset_split"] = (job.dataset_split or "").strip()
+    gt["ply_path"] = job.ply_path
+    gt["output_layout_config"] = job.output_layout
+    _write_json(os.path.join(out_dir, "gt.json"), gt)
 
 
 def _run_one_job(
@@ -317,13 +619,37 @@ def run() -> None:
         "--num_gpus",
         type=int,
         default=1,
-        help="并行使用的 GPU 数量，每个任务绑定一张卡。默认 1（单卡顺序执行）。0 表示自动检测并使用全部可见 GPU。",
+        help="默认 1 单卡顺序。≥2 时为「最多同时并行几个仿真任务」；"
+        "候选卡为全部可见物理 GPU（或 CUDA_VISIBLE_DEVICES 列表），在整机范围内选最空的卡，"
+        "而不是只用编号 0..N-1。0 表示并行数=可见 GPU 数量。",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="与 train_config 中 quiet 任一开启：子进程加 --quiet；本进程用 tqdm 显示总进度与 ETA。",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="若指定则覆盖 train_config.dataset_name：样本写入 output_root/<名称>/[split]/000000/ 并写 gt.json。",
+    )
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default=None,
+        help="若指定则覆盖 train_config.dataset_split（默认 train；设为空字符串则不要 train|test 中间目录）。",
     )
     args = parser.parse_args()
 
     model_dir = args.model_path
     material_space = _read_json(args.material_space_config)
-    train_cfg = _read_json(args.train_config)
+    train_cfg = dict(_read_json(args.train_config))
+    if args.dataset_name is not None:
+        train_cfg["dataset_name"] = args.dataset_name
+    if args.dataset_split is not None:
+        train_cfg["dataset_split"] = args.dataset_split
+    quiet_run = bool(args.quiet) or bool(train_cfg.get("quiet", False))
 
     seed = int(train_cfg.get("seed", 0))
     rng = random.Random(seed)
@@ -356,7 +682,8 @@ def run() -> None:
     num_gpus = args.num_gpus
     if num_gpus == 0:
         num_gpus = _torch.cuda.device_count() if _torch.cuda.is_available() else 1
-        print(f"自动检测到 {num_gpus} 张 GPU，将并行运行。")
+        if not quiet_run:
+            print(f"自动检测到 {num_gpus} 张 GPU，将并行运行。")
     if num_gpus < 1:
         num_gpus = 1
 
@@ -382,10 +709,23 @@ def run() -> None:
         base_cfg = _read_json(base_cfg_by_sim[job.sim_type])
         run_cfg = _make_run_config(base_cfg, job.sim_type, job.material_params)
 
-        sample_idx = _next_sample_index(job)
-        out_dir = _job_output_dir(job, sample_idx)
+        if job.dataset_name:
+            path_idx = idx
+        else:
+            path_idx = _next_sample_index(job)
+        out_dir = _job_output_dir(job, path_idx)
         os.makedirs(out_dir, exist_ok=True)
-        _write_gt_parameters_json(out_dir, job, idx)
+        _write_gt_parameters_json(
+            out_dir, job, idx, sample_index_for_output=path_idx
+        )
+        if job.dataset_name:
+            _write_gt_json_dataset_layout(
+                out_dir,
+                job,
+                idx,
+                path_idx,
+                train_seed=seed,
+            )
 
         cfg_path = os.path.join(tmp_cfg_dir, f"{idx:06d}_{job.sim_type}.json")
         _write_json(cfg_path, run_cfg)
@@ -408,21 +748,102 @@ def run() -> None:
             str(job.num_render_views),
             "--num_render_timesteps",
             str(job.num_render_timesteps),
-            "--field_output_interval",
-            str(job.field_output_interval),
         ]
+        if float(job.render_outputs_per_sim_second) > 0.0:
+            cmd.extend(
+                [
+                    "--render_outputs_per_sim_second",
+                    str(float(job.render_outputs_per_sim_second)),
+                ]
+            )
+        cmd.extend(
+            [
+                "--field_output_interval",
+                str(job.field_output_interval),
+            ]
+        )
         if job.render_img:
             cmd.append("--render_img")
         if job.compile_video:
             cmd.append("--compile_video")
+        if job.delete_png_sequences_after_compile_video:
+            cmd.append("--delete_png_sequences_after_compile_video")
         if job.output_deformation:
             cmd.append("--output_deformation")
         if job.output_stress:
             cmd.append("--output_stress")
         if job.output_view_stress_heatmap:
             cmd.append("--output_view_stress_heatmap")
-        if job.output_view_tracks2d:
-            cmd.append("--output_view_tracks2d")
+        if job.output_view_stress_gaussian:
+            cmd.append("--output_view_stress_gaussian")
+            cmd.extend(
+                [
+                    "--stress_gaussian_colormap_steps",
+                    str(job.stress_gaussian_colormap_steps),
+                    "--stress_gaussian_vm_pct_low",
+                    str(job.stress_gaussian_vm_pct_low),
+                    "--stress_gaussian_vm_pct_high",
+                    str(job.stress_gaussian_vm_pct_high),
+                ]
+            )
+        if job.output_view_flow_gaussian:
+            cmd.append("--output_view_flow_gaussian")
+            cmd.extend(
+                [
+                    "--flow_gaussian_max_gaussians",
+                    str(job.flow_gaussian_max_gaussians),
+                    "--flow_gaussian_seed",
+                    str(job.flow_gaussian_seed),
+                    "--flow_gaussian_depth_gamma",
+                    str(job.flow_gaussian_depth_gamma),
+                    "--flow_gaussian_depth_eps",
+                    str(job.flow_gaussian_depth_eps),
+                    "--flow_gaussian_opacity_power",
+                    str(job.flow_gaussian_opacity_power),
+                    "--flow_gaussian_vis_max_motion",
+                    str(job.flow_gaussian_vis_max_motion),
+                ]
+            )
+        if job.output_view_tracks_gaussian:
+            cmd.append("--output_view_tracks_gaussian")
+            cmd.extend(
+                [
+                    "--tracks_gaussian_max_tracks",
+                    str(job.tracks_gaussian_max_tracks),
+                    "--tracks_gaussian_sigma_scale",
+                    str(job.tracks_gaussian_sigma_scale),
+                    "--tracks_gaussian_point_opacity",
+                    str(job.tracks_gaussian_point_opacity),
+                    "--tracks_gaussian_intensity",
+                    str(job.tracks_gaussian_intensity),
+                    "--tracks_gaussian_seed",
+                    str(job.tracks_gaussian_seed),
+                    "--tracks_gaussian_accum_mode",
+                    str(job.tracks_gaussian_accum_mode),
+                    "--tracks_gaussian_accum_frame_weight",
+                    str(job.tracks_gaussian_accum_frame_weight),
+                    "--tracks_gaussian_accum_decay",
+                    str(job.tracks_gaussian_accum_decay),
+                ]
+            )
+            if job.tracks_gaussian_accum_midpoint:
+                cmd.append("--tracks_gaussian_accum_midpoint")
+            if job.tracks_gaussian_accum_no_normalize_save:
+                cmd.append("--tracks_gaussian_accum_no_normalize_save")
+        if job.output_subsampled_world_tracks:
+            cmd.append("--output_subsampled_world_tracks")
+            cmd.extend(
+                [
+                    "--subsampled_tracks_num",
+                    str(job.subsampled_tracks_num),
+                    "--subsampled_tracks_seed",
+                    str(job.subsampled_tracks_seed),
+                    "--subsampled_tracks_ortho_axes",
+                    str(job.subsampled_tracks_ortho_axes),
+                    "--subsampled_tracks_video_size",
+                    str(job.subsampled_tracks_video_size),
+                ]
+            )
         if job.no_volumetric_stress_deformation:
             cmd.append("--no_volumetric_stress_deformation")
         if job.output_bc_info:
@@ -433,69 +854,179 @@ def run() -> None:
             cmd.append("--white_bg")
         if job.debug:
             cmd.append("--debug")
+        # 多卡时子进程并行写 stderr 会打乱总进度条；默认对子进程加 --quiet
+        _verbose_multi = bool(train_cfg.get("verbose_subprocess_multi_gpu", False))
+        if quiet_run or (num_gpus > 1 and not _verbose_multi):
+            cmd.append("--quiet")
 
         tasks.append((idx, job, cmd, out_dir))
 
     if num_gpus <= 1:
-        # 单卡顺序执行（与原逻辑一致）
-        for idx, job, cmd, out_dir in tasks:
-            print(f"\n[{idx+1}/{len(jobs)}] Running: {os.path.basename(job.ply_path)} | {job.sim_type} | {job.material_params}")
-            print(f"  out: {out_dir}")
+        job_pbar = tqdm(
+            tasks,
+            desc="批量仿真",
+            unit="job",
+            dynamic_ncols=True,
+            smoothing=0.05,
+        )
+        for idx, job, cmd, out_dir in job_pbar:
+            short = os.path.basename(job.ply_path)[:24]
+            job_pbar.set_postfix_str(
+                f"#{idx + 1}/{len(tasks)} {job.sim_type} {short}",
+                refresh=False,
+            )
             proc = subprocess.run(cmd, cwd=script_dir, env=_run_env)
             if proc.returncode != 0:
+                tqdm.write(f"Job failed (exit={proc.returncode}) out={out_dir}")
                 raise RuntimeError(f"Job failed (exit={proc.returncode}): {cmd}")
     else:
-        # 多卡并行：主进程直接用 Popen 启动子进程，每个子进程显式设置 CUDA_VISIBLE_DEVICES，避免 fork/进程池导致只跑在一张卡上
-        gpu_task_lists: List[List[Tuple[int, Job, List[str], str]]] = [[] for _ in range(num_gpus)]
-        for idx, job, cmd, out_dir in tasks:
-            gpu_task_lists[idx % num_gpus].append((idx, job, cmd, out_dir))
+        # 多卡并行：按 nvidia-smi 找「空闲」物理 GPU 动态派单；全忙则等待轮询
+        max_util_pct = int(train_cfg.get("idle_gpu_max_util_pct", 10))
+        # 默认同卡需约 ≥20GiB 空闲再派单，避免「util 低但显存已满」时 Taichi ti.init OOM
+        min_free_mib = int(train_cfg.get("idle_gpu_min_free_mib", 20480))
+        relax_util_free_mib = int(
+            train_cfg.get("idle_gpu_relax_util_when_free_mib", 0)
+        )
+        poll_wait_s = float(train_cfg.get("idle_gpu_poll_seconds", 2.0))
+        smi_failed_assume_idle = bool(
+            train_cfg.get("idle_gpu_if_smi_fails_assume_idle", True)
+        )
 
-        print(f"\n多卡并行: 使用 {num_gpus} 张 GPU，共 {len(tasks)} 个任务。")
-        for gpu_id in range(num_gpus):
-            n = len(gpu_task_lists[gpu_id])
-            print(f"  GPU {gpu_id}: {n} 个任务")
+        torch_n = _torch.cuda.device_count() if _torch.cuda.is_available() else 1
+        gpu_pool = _all_schedulable_physical_gpu_ids(torch_n)
+        if not gpu_pool:
+            raise RuntimeError(
+                "多卡模式未解析到任何候选 GPU（请检查 CUDA_VISIBLE_DEVICES 或 nvidia-smi）。"
+            )
+        max_parallel_jobs = min(int(num_gpus), len(gpu_pool))
+        if max_parallel_jobs < 1:
+            max_parallel_jobs = 1
 
-        # active[gpu_id] = (popen, idx, out_dir)
+        if not quiet_run:
+            mem_rule = (
+                f"free≥{min_free_mib} MiB"
+                if min_free_mib > 0
+                else "不检查显存（仅 util）"
+            )
+            relax_rule = (
+                f"；free≥{relax_util_free_mib} MiB 时不卡 util"
+                if relax_util_free_mib > 0
+                else ""
+            )
+            print(
+                f"\n多卡动态调度: 候选池 {len(gpu_pool)} 张卡 {gpu_pool}，"
+                f"最多同时 {max_parallel_jobs} 个任务；"
+                f"占卡 util≤{max_util_pct}% 且 {mem_rule}{relax_rule}；"
+                f"优先选剩余显存最大的卡；不满足则每 {poll_wait_s:g}s 重试。"
+            )
+
+        pending = deque(tasks)
         active: Dict[int, Tuple[subprocess.Popen, int, str]] = {}
-        gpu_next: List[int] = [0] * num_gpus  # 每个 GPU 下一个要执行的任务在 gpu_task_lists[gpu_id] 中的下标
         failed: List[Tuple[int, int, str]] = []
+        smi_warned = False
+        last_wait_log_t = 0.0
 
-        def start_one(gpu_id: int) -> bool:
-            """若该 GPU 还有任务则启动一个，返回是否已启动。"""
-            if gpu_id in active:
-                return False
-            lst = gpu_task_lists[gpu_id]
-            i = gpu_next[gpu_id]
-            if i >= len(lst):
-                return False
-            idx, job, cmd, out_dir = lst[i]
-            gpu_next[gpu_id] = i + 1
-            # 用系统 env 在命令行强制设置 CUDA_VISIBLE_DEVICES，避免子进程继承或未生效
-            full_cmd = ["env", f"CUDA_VISIBLE_DEVICES={gpu_id}", sys.executable] + cmd[1:]
-            popen = subprocess.Popen(full_cmd, cwd=script_dir, env=_run_env)
-            active[gpu_id] = (popen, idx, out_dir)
-            print(f"  [GPU {gpu_id}] 启动任务 {idx+1}/{len(tasks)}: {os.path.basename(job.ply_path)} | {job.sim_type}")
-            return True
+        pbar = tqdm(
+            total=len(tasks),
+            desc="批量仿真 (动态GPU)",
+            unit="job",
+            dynamic_ncols=True,
+            smoothing=0.05,
+        )
 
-        # 先为每张卡各启动一个任务
-        for gpu_id in range(num_gpus):
-            start_one(gpu_id)
-
-        while active:
-            for gpu_id in list(active.keys()):
-                popen, idx, out_dir = active[gpu_id]
+        while pending or active:
+            for gid in list(active.keys()):
+                popen, idx, out_dir = active[gid]
                 ret = popen.poll()
                 if ret is not None:
-                    del active[gpu_id]
+                    del active[gid]
+                    pbar.update(1)
                     if ret != 0:
                         failed.append((idx, ret, out_dir))
-                    if not start_one(gpu_id):
-                        pass  # 该 GPU 无更多任务
-            time.sleep(0.2)
+
+            states = _nvidia_smi_gpu_states()
+            if states is None and not smi_warned and not quiet_run:
+                tqdm.write(
+                    "[auto_simulation_runner] 无法查询 nvidia-smi；"
+                    f"空闲检测改为 assume_idle={smi_failed_assume_idle}（见 train_config idle_gpu_if_smi_fails_assume_idle）。"
+                )
+                smi_warned = True
+
+            assume_idle = smi_failed_assume_idle or (states is None)
+            launched_this_round = 0
+            while pending:
+                if len(active) >= max_parallel_jobs:
+                    break
+                chosen: Optional[int] = None
+                best_free = -1
+                for gid in gpu_pool:
+                    if gid in active:
+                        continue
+                    if not _physical_gpu_looks_idle(
+                        gid,
+                        states,
+                        max_util_pct,
+                        min_free_mib,
+                        relax_util_when_free_mib=relax_util_free_mib,
+                        smi_failed_assume_idle=assume_idle,
+                    ):
+                        continue
+                    free_here = 0
+                    if states is not None:
+                        for g, f_mib, _u in states:
+                            if g == gid:
+                                free_here = f_mib
+                                break
+                    if free_here > best_free:
+                        best_free = free_here
+                        chosen = gid
+                if chosen is None:
+                    break
+                idx, job, cmd, out_dir = pending.popleft()
+                full_cmd = [
+                    "env",
+                    f"CUDA_VISIBLE_DEVICES={chosen}",
+                    sys.executable,
+                ] + cmd[1:]
+                popen = subprocess.Popen(full_cmd, cwd=script_dir, env=_run_env)
+                active[chosen] = (popen, idx, out_dir)
+                launched_this_round += 1
+
+            if pending:
+                if active:
+                    time.sleep(0.2)
+                else:
+                    now = time.time()
+                    if now - last_wait_log_t >= 15.0 and not quiet_run:
+                        tqdm.write(
+                            f"[auto_simulation_runner] 等待可占卡… 剩余任务 {len(pending)}，"
+                            f"已占 {len(active)}/{max_parallel_jobs}；"
+                            f"条件 util≤{max_util_pct}%"
+                            + (
+                                f", free≥{min_free_mib} MiB"
+                                if min_free_mib > 0
+                                else ""
+                            )
+                            + (
+                                f"（或 free≥{relax_util_free_mib} 忽略 util）"
+                                if relax_util_free_mib > 0
+                                else ""
+                            )
+                            + ")"
+                        )
+                        last_wait_log_t = now
+                    time.sleep(poll_wait_s)
+            elif active:
+                time.sleep(0.2)
+
+        pbar.close()
 
         if failed:
             for idx, ret, out_dir in failed:
-                print(f"失败: job_idx={idx} returncode={ret} out={out_dir}", file=sys.stderr)
+                tqdm.write(
+                    f"失败: job_idx={idx} returncode={ret} out={out_dir}",
+                    file=sys.stderr,
+                )
             raise RuntimeError(f"有 {len(failed)} 个任务失败，见上方 stderr。")
 
 

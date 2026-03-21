@@ -1,9 +1,18 @@
 import sys
 
+# 须在 import warp / 大量依赖之前判断，以便 WARP_LOG_LEVEL 等对启动日志生效
+_QUIET_EARLY = "--quiet" in sys.argv
+if _QUIET_EARLY:
+    import os as _os_q
+
+    _os_q.environ.setdefault("WARP_LOG_LEVEL", "error")
+    _os_q.environ.setdefault("TI_LOG_LEVEL", "error")
+
 sys.path.append("gaussian-splatting")
 import argparse
+import contextlib
 import math
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import torch
@@ -53,12 +62,17 @@ from my_utils.sim_utils import (
     write_stress_pcd_camera_meta_json,
 )
 from my_utils.view_auxiliary_output import (
-    ViewTrackBuffer,
+    FlowGaussianSplatSharedState,
+    TrajectoryGaussianAccumSharedState,
     compute_render_frame_indices,
+    count_render_samples_for_sim_rate,
     frame_to_output_index,
+    project_world_points_to_screen_means2d,
     splat_stress_heatmap_bgr,
+    stress_gaussian_precomp_colors_and_opacity,
     stress_scalars_aligned_to_render_chain,
     write_run_parameters_json,
+    write_subsampled_world_tracks_ortho_pngs,
 )
 from my_utils.filling_cache import (
     build_filling_fingerprint,
@@ -67,12 +81,6 @@ from my_utils.filling_cache import (
     save_filled_positions,
     try_load_filled_positions,
 )
-
-# 排查推理速度 / 轨迹：暂时关闭；恢复时改为 False
-_VIEW_TRACKS2D_TEMP_DISABLED = True
-# 视角应力热力图：与 RGB 使用相同相机（--output_view_stress_heatmap）；数据集构建建议开启
-_VIEW_STRESS_HEATMAP_TEMP_DISABLED = False
-
 
 def _select_best_gpu() -> None:
     """
@@ -84,6 +92,7 @@ def _select_best_gpu() -> None:
     2. 优先在 GPU 利用率 < 10% 的卡中选择 free_mem 最大的；
     3. 如果没有满足利用率条件的卡，则在所有卡中选 free_mem 最大的。
     """
+    _gpu_quiet = "--quiet" in sys.argv
     if os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() != "":
         # 已由外部指定（如 auto_simulation_runner 多卡分配），不再自动选择
         return
@@ -98,7 +107,8 @@ def _select_best_gpu() -> None:
         lines = result.decode("utf-8").strip().split("\n")
 
         candidates = []
-        print("[modified_simulation] GPU status from nvidia-smi:")
+        if not _gpu_quiet:
+            print("[modified_simulation] GPU status from nvidia-smi:")
         for line in lines:
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != 3:
@@ -107,10 +117,14 @@ def _select_best_gpu() -> None:
             mem_free = int(parts[1])  # MiB
             util = int(parts[2])      # %
             candidates.append((gpu_id, mem_free, util))
-            print(f"  - GPU {gpu_id}: free_mem={mem_free} MiB, util={util}%")
+            if not _gpu_quiet:
+                print(f"  - GPU {gpu_id}: free_mem={mem_free} MiB, util={util}%")
 
         if not candidates:
-            print("[modified_simulation] nvidia-smi returned no GPU info, using default CUDA device.")
+            if not _gpu_quiet:
+                print(
+                    "[modified_simulation] nvidia-smi returned no GPU info, using default CUDA device."
+                )
             return
 
         # 首选利用率较低的 GPU
@@ -120,10 +134,11 @@ def _select_best_gpu() -> None:
         best_gpu, best_mem, best_util = max(target_pool, key=lambda x: x[1])
 
         os.environ["CUDA_VISIBLE_DEVICES"] = str(best_gpu)
-        print(
-            "[modified_simulation] Auto-selected GPU id "
-            f"{best_gpu} with free_mem={best_mem} MiB, util={best_util}%."
-        )
+        if not _gpu_quiet:
+            print(
+                "[modified_simulation] Auto-selected GPU id "
+                f"{best_gpu} with free_mem={best_mem} MiB, util={best_util}%."
+            )
     except Exception as e:
         print(f"[modified_simulation] GPU auto-selection failed ({e}), using default CUDA device.")
 
@@ -131,10 +146,17 @@ def _select_best_gpu() -> None:
 # 在 Warp / Taichi 初始化之前自动选择显卡
 _select_best_gpu()
 
-wp.init()
-wp.config.verify_cuda = True
-
-ti.init(arch=ti.cuda, device_memory_GB=8.0)
+if _QUIET_EARLY:
+    # 屏蔽 [Taichi]/Warp 启动横幅、设备列表、部分 JIT 提示（多卡 runner 子进程）
+    with open(os.devnull, "w") as _dn:
+        with contextlib.redirect_stdout(_dn), contextlib.redirect_stderr(_dn):
+            wp.init()
+            wp.config.verify_cuda = True
+            ti.init(arch=ti.cuda, device_memory_GB=8.0)
+else:
+    wp.init()
+    wp.config.verify_cuda = True
+    ti.init(arch=ti.cuda, device_memory_GB=8.0)
 
 
 class PipelineParamsNoparse:
@@ -171,8 +193,9 @@ def load_checkpoint(model_path, sh_degree=3, iteration=-1):
                 break
 
     if "f_rest_" not in header:
-        print("Detected PhysGaussian format (no SH rest terms).")
-        print("Switching sh_degree -> 0")
+        if "--quiet" not in sys.argv:
+            print("Detected PhysGaussian format (no SH rest terms).")
+            print("Switching sh_degree -> 0")
         sh_degree = 0
 
     # ----------------------------
@@ -231,7 +254,19 @@ if __name__ == "__main__":
     parser.add_argument("--output_h5", action="store_true", help="保存仿真粒子为 h5（不保存 simulation ply）")
     parser.add_argument("--render_img", action="store_true")
     parser.add_argument("--compile_video", action="store_true")
+    parser.add_argument(
+        "--delete_png_sequences_after_compile_video",
+        action="store_true",
+        help="须与 --compile_video 同开：某个 PNG 目录被 ffmpeg 成功合成 mp4 后，删除该目录下序列帧"
+        "（images/、stress_gaussian/、tracks_gaussian/、flow_gaussian/ 下对应视角子目录；"
+        "以及 tracks_subsampled_world/ortho_frames/<轴>）。默认保留 PNG。",
+    )
     parser.add_argument("--white_bg", action="store_true")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="减少日志：屏蔽 Warp/Taichi 启动横幅、关闭仿真帧 tqdm，并静默 BC/ffmpeg 成功等；错误仍输出。",
+    )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
         "--no_filling_cache",
@@ -267,18 +302,197 @@ if __name__ == "__main__":
         "--num_render_timesteps",
         type=int,
         default=0,
-        help="在整个仿真上均匀输出多少帧的渲染图/视角辅助（0 或 ≥仿真帧数表示每帧都输出）。"
-        "输出文件按 0000..K-1 编号，meta 中记录与仿真帧下标的对应。",
+        help="当未使用 --render_outputs_per_sim_second（≤0）时生效：在整个仿真上均匀输出 K 帧"
+        "（0 或 ≥仿真帧数表示每仿真步都输出）。与后者同开时以 N 为准。",
+    )
+    parser.add_argument(
+        "--render_outputs_per_sim_second",
+        type=float,
+        default=0.0,
+        help="统一采样率 N（每秒仿真时间输出多少张）：总张数 K≈round(仿真总秒数×N)，"
+        "在 [0,frame_num-1] 上均匀取 K 个仿真步做 render/stress/flow 等输出；"
+        "compile_video 时 ffmpeg -framerate 也用 N，使视频时长≈仿真总时长。≤0 时改用 --num_render_timesteps。",
     )
     parser.add_argument(
         "--output_view_stress_heatmap",
         action="store_true",
-        help="每视角 2D 应力热力图。若 _VIEW_STRESS_HEATMAP_TEMP_DISABLED=True 则暂不生成。",
+        help="每视角 2D 应力热力图（屏幕空间 splat，非 3DGS）。",
     )
     parser.add_argument(
-        "--output_view_tracks2d",
+        "--output_view_stress_gaussian",
         action="store_true",
-        help="每个视角输出 2D 投影轨迹（tracks_2d/*.npz）。当前版本若 _VIEW_TRACKS2D_TEMP_DISABLED=True 则暂不写出。",
+        help="每视角额外一次 3DGS 光栅化：按 von Mises 调制预计算颜色与不透明度（不改变 MPM/高斯参数，仅多写 PNG）。",
+    )
+    parser.add_argument(
+        "--stress_gaussian_opa_floor",
+        type=float,
+        default=0.12,
+        help="应力 3DGS：低应力端相对原 opacity 缩放下限（与离线 render_stress_gaussian 一致）。",
+    )
+    parser.add_argument(
+        "--stress_gaussian_opa_ceil",
+        type=float,
+        default=1.0,
+        help="应力 3DGS：高应力端相对原 opacity 缩放上限。",
+    )
+    parser.add_argument(
+        "--stress_gaussian_sh_blend",
+        type=float,
+        default=0.35,
+        help="应力 3DGS：SH 底色权重，应力伪彩色权重为 1-该值。",
+    )
+    parser.add_argument(
+        "--stress_gaussian_colormap_steps",
+        type=int,
+        default=24,
+        help="应力 3DGS：von Mises 绝对值线性映射到 JET 阶梯的档数（≥2）。",
+    )
+    parser.add_argument(
+        "--stress_gaussian_vm_pct_low",
+        type=float,
+        default=1.0,
+        help="应力 3DGS：每帧 von Mises 绝对值色标下分位%%（与 vm_pct_high 一起框定，抗离群）。",
+    )
+    parser.add_argument(
+        "--stress_gaussian_vm_pct_high",
+        type=float,
+        default=99.0,
+        help="应力 3DGS：每帧 von Mises 绝对值色标上分位%%；全 min/max 可设 0 与 100。",
+    )
+    parser.add_argument(
+        "--output_view_flow_gaussian",
+        action="store_true",
+        help="与主光栅同相机：第二遍 CUDA 3DGS，colors_precomp 为屏幕 (Δu,Δv) 的 Middlebury 伪彩，"
+        "opacity 含原不透明度×幅值×距离权重；黑底输出 flow_gaussian/<view>/；不写 npz。",
+    )
+    parser.add_argument(
+        "--flow_gaussian_max_gaussians",
+        type=int,
+        default=8192,
+        help="参与 splat 的高斯数上限（仅从前 gs_num 个 MPM 高斯中随机下采样）。",
+    )
+    parser.add_argument(
+        "--flow_gaussian_seed",
+        type=int,
+        default=0,
+        help="flow 下采样随机种子（各视角共用同一批下标）。",
+    )
+    parser.add_argument(
+        "--flow_gaussian_depth_gamma",
+        type=float,
+        default=1.0,
+        help="距离权重：(1/(dist+eps))^gamma，越大越强调近处 splat。",
+    )
+    parser.add_argument(
+        "--flow_gaussian_depth_eps",
+        type=float,
+        default=1e-2,
+        help="距离权重的 ε，避免除零（与场景尺度同量级时可调）。",
+    )
+    parser.add_argument(
+        "--flow_gaussian_opacity_power",
+        type=float,
+        default=1.0,
+        help="权重中不透明度项：opacity^power。",
+    )
+    parser.add_argument(
+        "--flow_gaussian_vis_max_motion",
+        type=float,
+        default=0.0,
+        help="伪彩饱和位移（像素）；≤0 则每帧按有效像素分位数自动估计。",
+    )
+    parser.add_argument(
+        "--output_view_tracks_gaussian",
+        action="store_true",
+        help="每视角 3DGS 微型高斯轨迹（黑底）：整物体 MPM 下采样，每输出帧光栅当前（+可选中点）并叠到轨迹图；多视角共用 splat。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_accum_mode",
+        type=str,
+        default="max",
+        choices=("max", "add"),
+        help="轨迹缓冲：max=逐像素取大（线条清晰、后期不糊）；add=逐帧相加（易叠成雾）。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_accum_frame_weight",
+        type=float,
+        default=1.0,
+        help="轨迹：max 模式下为本帧 splat 峰值缩放；add 模式下为加到累加图的系数。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_accum_decay",
+        type=float,
+        default=1.0,
+        help="轨迹：每帧先 轨迹图 *= decay 再叠加（1=全程保留；<1 旧迹变淡）。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_accum_midpoint",
+        action="store_true",
+        help="轨迹：在上一输出时刻与当前时刻位置中点再 splat（约 2× 点数、折线更连贯）。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_accum_no_normalize_save",
+        action="store_true",
+        help="轨迹：写 PNG 时不按 max 归一化，仅用 tracks_gaussian_intensity 线性缩放再 clamp。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_max_tracks",
+        type=int,
+        default=2048,
+        help="轨迹：整物体 MPM 粒子下采样数量上限。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_sigma_scale",
+        type=float,
+        default=0.0012,
+        help="轨迹微型高斯各向同性 σ ≈ scale_origin * 该系数（世界系）；越小线越细越利落。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_point_opacity",
+        type=float,
+        default=1.0,
+        help="轨迹每个 splat 的不透明度 ∈(0,1]；配合较小 sigma 建议 1.0。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_intensity",
+        type=float,
+        default=1.0,
+        help="轨迹：与 --tracks_gaussian_accum_no_normalize_save 联用时的线性缩放；默认写图前按 acc.max() 归一化时可忽略。",
+    )
+    parser.add_argument(
+        "--tracks_gaussian_seed",
+        type=int,
+        default=0,
+        help="轨迹下采样选粒子的随机种子（各视角共用同一批粒子下标）。",
+    )
+    parser.add_argument(
+        "--output_subsampled_world_tracks",
+        action="store_true",
+        help="不下光栅化：对仿真粒子下采样，按输出时刻记录世界坐标轨迹 tracks_subsampled_world/tracks_world.npz（与 num_render_timesteps 对齐）。",
+    )
+    parser.add_argument(
+        "--subsampled_tracks_num",
+        type=int,
+        default=1024,
+        help="下采样追踪的粒子数（≤ MPM 粒子数）。",
+    )
+    parser.add_argument(
+        "--subsampled_tracks_seed",
+        type=int,
+        default=0,
+        help="下采样选粒子随机种子。",
+    )
+    parser.add_argument(
+        "--subsampled_tracks_ortho_axes",
+        type=str,
+        default="xz",
+        help="compile_video 时正交轨迹预览 mp4 使用的世界系两维：xy / xz / yz。",
+    )
+    parser.add_argument(
+        "--subsampled_tracks_video_size",
+        type=int,
+        default=512,
+        help="正交轨迹预览视频的边长（正方形，像素）。",
     )
     parser.add_argument(
         "--no_volumetric_stress_deformation",
@@ -288,24 +502,13 @@ if __name__ == "__main__":
     #export deformation
     args = parser.parse_args()
 
-    want_tracks2d = bool(args.output_view_tracks2d) and not _VIEW_TRACKS2D_TEMP_DISABLED
-    if _VIEW_TRACKS2D_TEMP_DISABLED and args.output_view_tracks2d:
-        print(
-            "[modified_simulation] 已请求 --output_view_tracks2d，但轨迹输出暂时关闭"
-            "（_VIEW_TRACKS2D_TEMP_DISABLED）。",
-            flush=True,
-        )
+    _vprint = print if not bool(getattr(args, "quiet", False)) else (lambda *a, **k: None)
 
-    want_stress_heatmap = (
-        bool(args.output_view_stress_heatmap) and not _VIEW_STRESS_HEATMAP_TEMP_DISABLED
-    )
-    if _VIEW_STRESS_HEATMAP_TEMP_DISABLED and args.output_view_stress_heatmap:
-        print(
-            "[modified_simulation] 已请求 --output_view_stress_heatmap，但热力图暂时关闭"
-            "（_VIEW_STRESS_HEATMAP_TEMP_DISABLED），便于排查推理速度。",
-            flush=True,
-        )
-
+    want_flow_gaussian = bool(args.output_view_flow_gaussian)
+    want_tracks_gaussian = bool(args.output_view_tracks_gaussian)
+    want_subsampled_world_tracks = bool(args.output_subsampled_world_tracks)
+    want_stress_heatmap = bool(args.output_view_stress_heatmap)
+    want_stress_gaussian = bool(args.output_view_stress_gaussian)
     use_ply_dir = args.ply_dir is not None and os.path.isdir(args.ply_dir)
     use_ply_path = args.ply_path is not None and os.path.isfile(args.ply_path)
 
@@ -349,7 +552,7 @@ if __name__ == "__main__":
         tasks = [("checkpoint", args.model_path, args.output_path, args.model_path)]
 
     # load scene config（所有任务共用）
-    print("Loading scene config...")
+    _vprint("Loading scene config...")
     (
         material_params,
         bc_params,
@@ -361,11 +564,11 @@ if __name__ == "__main__":
     for task_idx, (task_type, path_or_ply, current_output_path, model_path_for_camera) in enumerate(tasks):
         if task_type == "ply":
             ply_path = path_or_ply
-            print(f"\n[{task_idx+1}/{len(tasks)}] 加载 PLY: {ply_path}")
+            _vprint(f"\n[{task_idx+1}/{len(tasks)}] 加载 PLY: {ply_path}")
             gaussians = load_gaussians_from_ply(ply_path)
             model_path = model_path_for_camera
         else:
-            print(f"\n[{task_idx+1}/{len(tasks)}] 加载 checkpoint: {path_or_ply}")
+            _vprint(f"\n[{task_idx+1}/{len(tasks)}] 加载 checkpoint: {path_or_ply}")
             model_path = path_or_ply
             gaussians = load_checkpoint(model_path)
         args.output_path = current_output_path
@@ -380,7 +583,7 @@ if __name__ == "__main__":
         )
 
         # init the scene
-        print("Initializing scene and pre-processing...")
+        _vprint("Initializing scene and pre-processing...")
         params = load_params_from_gs(gaussians, pipeline)
 
         init_pos = params["pos"]
@@ -505,12 +708,12 @@ if __name__ == "__main__":
                     )
 
             if mpm_init_pos is not None:
-                print(
+                _vprint(
                     f"[particle filling] 使用缓存: {cache_dir} "
                     f"(fingerprint={fingerprint[:16]}...)"
                 )
             else:
-                print("Filling internal particles...")
+                _vprint("Filling internal particles...")
                 mpm_init_pos = fill_particles(
                     pos=transformed_pos,
                     opacity=init_opacity,
@@ -544,7 +747,7 @@ if __name__ == "__main__":
                             "task_type": task_type,
                         },
                     )
-                    print(f"[particle filling] 已写入缓存: {cache_dir}")
+                    _vprint(f"[particle filling] 已写入缓存: {cache_dir}")
 
             if args.debug:
                 particle_position_tensor_to_ply(mpm_init_pos, "./log/filled_particles.ply")
@@ -552,7 +755,7 @@ if __name__ == "__main__":
             mpm_init_pos = transformed_pos.to(device=device)
 
         # init the mpm solver
-        print("Initializing MPM solver and setting up boundary conditions...")
+        _vprint("Initializing MPM solver and setting up boundary conditions...")
         mpm_init_vol = get_particle_volume(
             mpm_init_pos,
             material_params["n_grid"],
@@ -591,19 +794,19 @@ if __name__ == "__main__":
 
         # 基于仿真类型自动设置边界条件（当前支持 press/drop 自动推断）
         if args.sim_type == "press":
-            print("[modified_simulation] 自动根据粒子位置构造 press 边界条件...")
+            _vprint("[modified_simulation] 自动根据粒子位置构造 press 边界条件...")
             bc_params = build_press_boundary_conditions(mpm_init_pos, material_params)
         elif args.sim_type == "drop":
-            print("[modified_simulation] 自动构造 drop 边界条件（参考 drop_cube_jelly.json）...")
+            _vprint("[modified_simulation] 自动构造 drop 边界条件（参考 drop_cube_jelly.json）...")
             bc_params = build_drop_boundary_conditions(mpm_init_pos, material_params)
         elif args.sim_type == "shear":
-            print("[modified_simulation] 自动构造 shear 边界条件（上下 1/4 相反方向刚体平面）...")
+            _vprint("[modified_simulation] 自动构造 shear 边界条件（上下 1/4 相反方向刚体平面）...")
             bc_params = build_shear_boundary_conditions(mpm_init_pos, material_params)
         elif args.sim_type == "stretch":
-            print("[modified_simulation] 自动构造 stretch 边界条件（y 两端夹具拉伸）...")
+            _vprint("[modified_simulation] 自动构造 stretch 边界条件（y 两端夹具拉伸）...")
             bc_params = build_stretch_boundary_conditions(mpm_init_pos, material_params)
         elif args.sim_type == "bend":
-            print("[modified_simulation] 自动构造 bend 边界条件（沿最长轴方向底面固定+顶部刚性片推压）...")
+            _vprint("[modified_simulation] 自动构造 bend 边界条件（沿最长轴方向底面固定+顶部刚性片推压）...")
             bc_params = build_bend_boundary_conditions(mpm_init_pos, material_params)
 
             # 同时输出一份带自动 BC 的 config 供记录
@@ -616,11 +819,11 @@ if __name__ == "__main__":
                 )
                 with open(auto_cfg_path, "w") as f:
                     json.dump(sim_cfg, f, indent=4)
-                print(f"[modified_simulation] 自动生成 config 已保存到: {auto_cfg_path}")
+                _vprint(f"[modified_simulation] 自动生成 config 已保存到: {auto_cfg_path}")
             except Exception as e:
                 print(f"[modified_simulation] 写入自动 config 失败: {e}")
         else:
-            print(
+            _vprint(
                 f"[modified_simulation] sim_type={args.sim_type}，暂未实现自动 BC，继续使用模板 config 中的 boundary_conditions。"
             )
 
@@ -682,6 +885,11 @@ if __name__ == "__main__":
         shs_render = shs
         height = None
         width = None
+        fast_track_indices_np: Optional[np.ndarray] = None
+        fast_track_xyz_list: List[np.ndarray] = []
+        fast_track_sim_frames: List[int] = []
+        track_gaussian_accum_shared: Optional[TrajectoryGaussianAccumSharedState] = None
+        flow_gaussian_shared: Optional[FlowGaussianSplatSharedState] = None
 
         save_vol = not bool(args.no_volumetric_stress_deformation)
         eff_output_deformation = bool(args.output_deformation) and save_vol
@@ -694,11 +902,27 @@ if __name__ == "__main__":
             eff_output_stress_vol,
         )
 
-        render_frame_indices = compute_render_frame_indices(
-            frame_num, int(args.num_render_timesteps)
-        )
+        _n_per_s = float(getattr(args, "render_outputs_per_sim_second", 0.0) or 0.0)
+        if _n_per_s > 0.0:
+            _K = count_render_samples_for_sim_rate(
+                frame_num, float(frame_dt), _n_per_s
+            )
+            render_frame_indices = compute_render_frame_indices(frame_num, _K)
+            video_compile_fps = float(_n_per_s)
+        else:
+            render_frame_indices = compute_render_frame_indices(
+                frame_num, int(args.num_render_timesteps)
+            )
+            video_compile_fps = float(1.0 / float(frame_dt))
         frame_to_out_idx = frame_to_output_index(render_frame_indices)
         render_frame_set = set(render_frame_indices)
+        if _n_per_s > 0.0:
+            _vprint(
+                f"[modified_simulation] render_outputs_per_sim_second={_n_per_s}: "
+                f"仿真约 {float(frame_num) * float(frame_dt):.4g}s，"
+                f"均匀输出 {len(render_frame_indices)} 帧，"
+                f"compile 视频 -framerate={video_compile_fps}"
+            )
 
         # 输出初始帧场数据
         if eff_output_deformation or eff_output_stress_vol:
@@ -765,28 +989,35 @@ if __name__ == "__main__":
         # 若需要渲染，准备多视角的图像/视频输出目录
         image_root = None
         video_root = None
-        tracks_root = None
         if args.output_path is not None:
             if args.render_img:
                 image_root = os.path.join(args.output_path, "images")
                 os.makedirs(image_root, exist_ok=True)
-            if args.render_img and args.compile_video:
+            if args.compile_video and (
+                args.render_img
+                or want_stress_gaussian
+                or want_tracks_gaussian
+                or want_subsampled_world_tracks
+                or want_flow_gaussian
+            ):
                 video_root = os.path.join(args.output_path, "videos")
                 os.makedirs(video_root, exist_ok=True)
-            if want_tracks2d:
-                tracks_root = os.path.join(args.output_path, "tracks_2d")
-                os.makedirs(tracks_root, exist_ok=True)
 
         need_view_pass = (
             bool(args.render_img)
             or bool(want_stress_heatmap)
-            or bool(want_tracks2d)
+            or bool(want_stress_gaussian)
+            or bool(want_flow_gaussian)
+            or bool(want_tracks_gaussian)
         )
 
         # 定义多视角：方位角在 [0, 360) 上均匀分布，俯仰角固定为 config
         views: List[Tuple[float, float]] = []
         view_dirs: List[Optional[str]] = []
         stress_view_dirs: List[Optional[str]] = []
+        stress_gaussian_view_dirs: List[Optional[str]] = []
+        tracks_gaussian_view_dirs: List[Optional[str]] = []
+        flow_gaussian_view_dirs: List[Optional[str]] = []
         view_names: List[str] = []
         if need_view_pass and args.output_path is not None:
             nv_cfg = int(args.num_render_views)
@@ -812,13 +1043,48 @@ if __name__ == "__main__":
                     stress_view_dirs.append(sd)
                 else:
                     stress_view_dirs.append(None)
+                if want_stress_gaussian:
+                    sgd = os.path.join(args.output_path, "stress_gaussian", name)
+                    os.makedirs(sgd, exist_ok=True)
+                    stress_gaussian_view_dirs.append(sgd)
+                else:
+                    stress_gaussian_view_dirs.append(None)
+                if want_tracks_gaussian:
+                    tgd = os.path.join(args.output_path, "tracks_gaussian", name)
+                    os.makedirs(tgd, exist_ok=True)
+                    tracks_gaussian_view_dirs.append(tgd)
+                else:
+                    tracks_gaussian_view_dirs.append(None)
+                if want_flow_gaussian:
+                    fgd = os.path.join(args.output_path, "flow_gaussian", name)
+                    os.makedirs(fgd, exist_ok=True)
+                    flow_gaussian_view_dirs.append(fgd)
+                else:
+                    flow_gaussian_view_dirs.append(None)
         else:
             view_dirs = []
             stress_view_dirs = []
+            stress_gaussian_view_dirs = []
+            tracks_gaussian_view_dirs = []
+            flow_gaussian_view_dirs = []
             view_names = []
 
-        track_buffers: List[Optional[Any]] = (
-            [None] * len(views) if want_tracks2d else []
+        if (
+            want_flow_gaussian
+            and len(views) > 0
+            and args.output_path is not None
+        ):
+            flow_gaussian_shared = FlowGaussianSplatSharedState(
+                max_gaussians=int(args.flow_gaussian_max_gaussians),
+                rng_seed=int(args.flow_gaussian_seed),
+                depth_gamma=float(args.flow_gaussian_depth_gamma),
+                depth_eps=float(args.flow_gaussian_depth_eps),
+                opacity_power=float(args.flow_gaussian_opacity_power),
+            )
+            flow_gaussian_shared.resize_num_views(len(views))
+
+        track_gaussian_accum_rgb: List[Optional[torch.Tensor]] = (
+            [None] * len(views) if want_tracks_gaussian else []
         )
 
         def _match_means2d_to_P(screen_pts: torch.Tensor, n_points: int) -> torch.Tensor:
@@ -842,7 +1108,15 @@ if __name__ == "__main__":
                 return torch.cat([sp, pad], dim=0)
             return sp[:P]
 
-        for frame in tqdm(range(frame_num)):
+        _frame_bar = tqdm(
+            range(frame_num),
+            desc="仿真帧",
+            unit="帧",
+            disable=bool(getattr(args, "quiet", False)),
+            mininterval=0.5 if bool(getattr(args, "quiet", False)) else 0.1,
+            smoothing=0.05,
+        )
+        for frame in _frame_bar:
 
             for step in range(step_per_frame):
                 mpm_solver.p2g2p(frame, substep_dt, device=device)
@@ -874,10 +1148,12 @@ if __name__ == "__main__":
                     save_to_h5=True,
                 )
 
-            if need_view_pass and views and frame in render_frame_set:
+            if frame in render_frame_set and (
+                (need_view_pass and bool(views)) or want_subsampled_world_tracks
+            ):
                 out_idx = frame_to_out_idx[int(frame)]
                 # 与 save_stress_field 一致的三维应力：g2p 已更新 F_trial，须先刷新 τ 再读
-                if want_stress_heatmap:
+                if want_stress_heatmap or want_stress_gaussian:
                     mpm_solver.recompute_particle_stress_from_F_trial(
                         float(substep_dt), device=device
                     )
@@ -888,8 +1164,8 @@ if __name__ == "__main__":
                 cov3D_base = cov3D_base.view(-1, 6)[:gs_num].to(device)
                 rot_base = rot_base.view(-1, 3, 3)[:gs_num].to(device)
 
-                # 还原到世界坐标、Undo transform
-                pos_world = apply_inverse_rotations(
+                # 还原到世界坐标、Undo transform（仅 MPM 粒子）
+                pos_mpm_world = apply_inverse_rotations(
                     undotransform2origin(
                         undoshift2center111(pos_base), scale_origin, original_mean_pos
                     ),
@@ -901,92 +1177,307 @@ if __name__ == "__main__":
                 base_opacity = opacity_render
                 base_shs = shs_render
                 if preprocessing_params["sim_area"] is not None:
-                    pos_world = torch.cat([pos_world, unselected_pos], dim=0)
+                    pos_world = torch.cat([pos_mpm_world, unselected_pos], dim=0)
                     cov3D_world = torch.cat([cov3D_world, unselected_cov], dim=0)
                     base_opacity = torch.cat([opacity_render, unselected_opacity], dim=0)
                     base_shs = torch.cat([shs_render, unselected_shs], dim=0)
+                else:
+                    pos_world = pos_mpm_world
 
-                P = int(pos_world.shape[0])
-                means2d_input = _match_means2d_to_P(init_screen_points, P)
-                extra_tail = max(0, P - gs_num)
-
-                # 对每个视角分别渲染 / 视角辅助
-                for v_idx, (az, el) in enumerate(views):
-                    current_camera = get_camera_view(
-                        model_path,
-                        default_camera_index=camera_params["default_camera_index"],
-                        center_view_world_space=viewpoint_center_worldspace,
-                        observant_coordinates=observant_coordinates,
-                        show_hint=camera_params["show_hint"],
-                        init_azimuthm=az,
-                        init_elevation=el,
-                        init_radius=camera_params["init_radius"],
-                        move_camera=camera_params["move_camera"],
-                        current_frame=frame,
-                        delta_a=camera_params["delta_a"],
-                        delta_e=camera_params["delta_e"],
-                        delta_r=camera_params["delta_r"],
-                    )
-                    rasterize = initialize_resterize(
-                        current_camera, gaussians, pipeline, background
-                    )
-
-                    colors_precomp = convert_SH(
-                        base_shs, current_camera, gaussians, pos_world, rot_base
-                    )
-                    rendering, raddi = rasterize(
-                        means3D=pos_world,
-                        means2D=means2d_input,
-                        shs=None,
-                        colors_precomp=colors_precomp,
-                        opacities=base_opacity,
-                        scales=None,
-                        rotations=None,
-                        cov3D_precomp=cov3D_world,
-                    )
-                    if height is None or width is None:
-                        _tmp = rendering.permute(1, 2, 0).detach().cpu().numpy()
-                        _tmp = cv2.cvtColor(_tmp, cv2.COLOR_BGR2RGB)
-                        height = _tmp.shape[0] // 2 * 2
-                        width = _tmp.shape[1] // 2 * 2
-
-                    if args.render_img and view_dirs[v_idx] is not None:
-                        cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
-                        cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
-                        cv2.imwrite(
-                            os.path.join(view_dirs[v_idx], f"{out_idx:04d}.png"),
-                            255 * cv2_img,
+                if want_subsampled_world_tracks:
+                    if fast_track_indices_np is None:
+                        gsn = int(gs_num)
+                        if gsn < 1:
+                            fast_track_indices_np = np.zeros((0,), dtype=np.int64)
+                        else:
+                            nt = min(int(args.subsampled_tracks_num), gsn)
+                            rng_ft = np.random.RandomState(
+                                int(args.subsampled_tracks_seed)
+                            )
+                            fast_track_indices_np = rng_ft.choice(
+                                gsn, size=nt, replace=False
+                            )
+                            fast_track_indices_np.sort()
+                    if fast_track_indices_np.size == 0:
+                        samp = np.zeros((0, 3), dtype=np.float32)
+                    else:
+                        idx_t = torch.as_tensor(
+                            fast_track_indices_np,
+                            device=pos_mpm_world.device,
+                            dtype=torch.long,
                         )
+                        samp = pos_mpm_world[idx_t].detach().cpu().numpy().astype(
+                            np.float32
+                        )
+                    fast_track_xyz_list.append(samp)
+                    fast_track_sim_frames.append(int(frame))
 
-                    if want_stress_heatmap and stress_view_dirs[v_idx] is not None:
-                        sv = stress_scalars_aligned_to_render_chain(
+                vm_frame = None
+                P = 0
+                means2d_input = None
+                extra_tail = 0
+                if need_view_pass:
+                    P = int(pos_world.shape[0])
+                    means2d_input = _match_means2d_to_P(init_screen_points, P)
+                    extra_tail = max(0, P - gs_num)
+                    if want_stress_heatmap or want_stress_gaussian:
+                        vm_frame = stress_scalars_aligned_to_render_chain(
                             mpm_solver, gs_num, extra_tail, pos_world.device
                         )
-                        stress_np = sv.detach().cpu().numpy()
-                        heat_bgr = splat_stress_heatmap_bgr(
-                            means2d_input,
-                            raddi,
-                            stress_np,
-                            int(height),
-                            int(width),
+
+                track_gaussian_shared_batch = None
+                if need_view_pass and views and want_tracks_gaussian:
+                    if track_gaussian_accum_shared is None:
+                        track_gaussian_accum_shared = TrajectoryGaussianAccumSharedState(
+                            num_tracks=int(args.tracks_gaussian_max_tracks),
+                            rng_seed=int(args.tracks_gaussian_seed),
+                            midpoint_bridge=bool(args.tracks_gaussian_accum_midpoint),
                         )
-                        cv2.imwrite(
-                            os.path.join(
-                                stress_view_dirs[v_idx], f"{out_idx:04d}.png"
-                            ),
-                            heat_bgr,
+                    _so_acc = float(scale_origin.detach().cpu().item())
+                    _sig_acc = max(
+                        1e-8, _so_acc * float(args.tracks_gaussian_sigma_scale)
+                    )
+                    track_gaussian_shared_batch = (
+                        track_gaussian_accum_shared.build_raster_batch(
+                            pos_mpm_world,
+                            _sig_acc,
+                            pos_mpm_world.device,
+                            pos_mpm_world.dtype,
+                            splat_opacity=float(args.tracks_gaussian_point_opacity),
+                        )
+                    )
+
+                # 对每个视角分别渲染 / 视角辅助（需光栅化）
+                if need_view_pass and views:
+                    for v_idx, (az, el) in enumerate(views):
+                        current_camera = get_camera_view(
+                            model_path,
+                            default_camera_index=camera_params["default_camera_index"],
+                            center_view_world_space=viewpoint_center_worldspace,
+                            observant_coordinates=observant_coordinates,
+                            show_hint=camera_params["show_hint"],
+                            init_azimuthm=az,
+                            init_elevation=el,
+                            init_radius=camera_params["init_radius"],
+                            move_camera=camera_params["move_camera"],
+                            current_frame=frame,
+                            delta_a=camera_params["delta_a"],
+                            delta_e=camera_params["delta_e"],
+                            delta_r=camera_params["delta_r"],
+                        )
+                        rasterize = initialize_resterize(
+                            current_camera, gaussians, pipeline, background
                         )
 
-                    if want_tracks2d and tracks_root is not None:
-                        if track_buffers[v_idx] is None:
-                            track_buffers[v_idx] = ViewTrackBuffer(P)
-                        track_buffers[v_idx].append(
-                            int(frame),
-                            means2d_input,
-                            raddi,
-                            int(height),
-                            int(width),
+                        colors_precomp = convert_SH(
+                            base_shs, current_camera, gaussians, pos_world, rot_base
                         )
+                        rendering, raddi = rasterize(
+                            means3D=pos_world,
+                            means2D=means2d_input,
+                            shs=None,
+                            colors_precomp=colors_precomp,
+                            opacities=base_opacity,
+                            scales=None,
+                            rotations=None,
+                            cov3D_precomp=cov3D_world,
+                        )
+                        if height is None or width is None:
+                            _tmp = rendering.permute(1, 2, 0).detach().cpu().numpy()
+                            _tmp = cv2.cvtColor(_tmp, cv2.COLOR_BGR2RGB)
+                            height = _tmp.shape[0] // 2 * 2
+                            width = _tmp.shape[1] // 2 * 2
+
+                        # 光栅 CUDA 前向不会把屏幕坐标写回 Python means2D（仍为全零）；
+                        # 热力图 / flow 等辅助输出必须用与 preprocess 一致的投影。
+                        means2d_for_aux = project_world_points_to_screen_means2d(
+                            pos_world,
+                            current_camera.full_proj_transform,
+                            int(width),
+                            int(height),
+                        )
+
+                        if args.render_img and view_dirs[v_idx] is not None:
+                            cv2_img = rendering.permute(1, 2, 0).detach().cpu().numpy()
+                            cv2_img = cv2.cvtColor(cv2_img, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(
+                                os.path.join(view_dirs[v_idx], f"{out_idx:04d}.png"),
+                                255 * cv2_img,
+                            )
+
+                        if want_stress_heatmap and stress_view_dirs[v_idx] is not None:
+                            stress_np = vm_frame.detach().cpu().numpy()
+                            heat_bgr = splat_stress_heatmap_bgr(
+                                means2d_for_aux,
+                                raddi,
+                                stress_np,
+                                int(height),
+                                int(width),
+                            )
+                            cv2.imwrite(
+                                os.path.join(
+                                    stress_view_dirs[v_idx], f"{out_idx:04d}.png"
+                                ),
+                                heat_bgr,
+                            )
+
+                        if (
+                            want_stress_gaussian
+                            and stress_gaussian_view_dirs[v_idx] is not None
+                            and vm_frame is not None
+                        ):
+                            sg_colors, sg_opacity = stress_gaussian_precomp_colors_and_opacity(
+                                vm_frame,
+                                colors_precomp,
+                                base_opacity,
+                                gs_num,
+                                opa_floor=float(args.stress_gaussian_opa_floor),
+                                opa_ceil=float(args.stress_gaussian_opa_ceil),
+                                sh_blend=float(args.stress_gaussian_sh_blend),
+                                vm_pct_low=float(args.stress_gaussian_vm_pct_low),
+                                vm_pct_high=float(args.stress_gaussian_vm_pct_high),
+                                colormap_steps=int(args.stress_gaussian_colormap_steps),
+                            )
+                            rasterize_sg = initialize_resterize(
+                                current_camera, gaussians, pipeline, background
+                            )
+                            rendering_sg, _r_sg = rasterize_sg(
+                                means3D=pos_world,
+                                means2D=means2d_input,
+                                shs=None,
+                                colors_precomp=sg_colors,
+                                opacities=sg_opacity,
+                                scales=None,
+                                rotations=None,
+                                cov3D_precomp=cov3D_world,
+                            )
+                            cv2_sg = rendering_sg.permute(1, 2, 0).detach().cpu().numpy()
+                            cv2_sg = cv2.cvtColor(cv2_sg, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(
+                                os.path.join(
+                                    stress_gaussian_view_dirs[v_idx], f"{out_idx:04d}.png"
+                                ),
+                                255 * cv2_sg,
+                            )
+
+                        if want_tracks_gaussian and tracks_gaussian_view_dirs[v_idx] is not None:
+                            if track_gaussian_shared_batch is None:
+                                traj_img = torch.zeros_like(rendering)
+                            else:
+                                tpos, tcov, tcol, top = track_gaussian_shared_batch
+                                M = int(tpos.shape[0])
+                                means2d_t = torch.zeros(
+                                    (M, 2),
+                                    device=pos_world.device,
+                                    dtype=torch.float32,
+                                    requires_grad=True,
+                                )
+                                try:
+                                    means2d_t.retain_grad()
+                                except Exception:
+                                    pass
+                                bg_traj = torch.zeros(
+                                    (3,),
+                                    dtype=torch.float32,
+                                    device=pos_world.device,
+                                )
+                                r_tr = initialize_resterize(
+                                    current_camera, gaussians, pipeline, bg_traj
+                                )
+                                traj_img, _tr = r_tr(
+                                    means3D=tpos,
+                                    means2D=means2d_t,
+                                    shs=None,
+                                    colors_precomp=tcol,
+                                    opacities=top,
+                                    scales=None,
+                                    rotations=None,
+                                    cov3D_precomp=tcov,
+                                )
+                            acc = track_gaussian_accum_rgb[v_idx]
+                            if acc is None:
+                                acc = torch.zeros_like(traj_img)
+                            else:
+                                acc.mul_(float(args.tracks_gaussian_accum_decay))
+                            layer = traj_img * float(args.tracks_gaussian_accum_frame_weight)
+                            _tgm = str(args.tracks_gaussian_accum_mode).strip().lower()
+                            if _tgm == "add":
+                                acc.add_(layer)
+                            else:
+                                acc = torch.maximum(acc, layer)
+                            track_gaussian_accum_rgb[v_idx] = acc
+                            if bool(args.tracks_gaussian_accum_no_normalize_save):
+                                composed = torch.clamp(
+                                    acc * float(args.tracks_gaussian_intensity),
+                                    0.0,
+                                    1.0,
+                                )
+                            else:
+                                m = acc.max()
+                                if float(m.detach().cpu()) <= 1e-12:
+                                    composed = torch.zeros_like(acc)
+                                else:
+                                    composed = torch.clamp(acc / m, 0.0, 1.0)
+                            cv2_tg = composed.permute(1, 2, 0).detach().cpu().numpy()
+                            cv2_tg = cv2.cvtColor(cv2_tg, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(
+                                os.path.join(
+                                    tracks_gaussian_view_dirs[v_idx],
+                                    f"{out_idx:04d}.png",
+                                ),
+                                np.clip(255.0 * cv2_tg, 0, 255).astype(np.uint8),
+                            )
+
+                        if (
+                            want_flow_gaussian
+                            and flow_gaussian_shared is not None
+                            and v_idx < len(flow_gaussian_view_dirs)
+                            and flow_gaussian_view_dirs[v_idx] is not None
+                            and height is not None
+                            and width is not None
+                        ):
+                            flow_gaussian_shared.ensure_indices(int(gs_num))
+                            _fmm = float(args.flow_gaussian_vis_max_motion)
+                            fg_colors, fg_opa = (
+                                flow_gaussian_shared.build_flow_precomp_for_raster(
+                                    v_idx,
+                                    means2d_for_aux,
+                                    raddi,
+                                    pos_world,
+                                    base_opacity,
+                                    current_camera.camera_center,
+                                    int(width),
+                                    int(height),
+                                    max_motion=_fmm if _fmm > 0 else None,
+                                )
+                            )
+                            fg_bg = torch.zeros(
+                                (3,),
+                                dtype=torch.float32,
+                                device=pos_world.device,
+                            )
+                            rasterize_fg = initialize_resterize(
+                                current_camera, gaussians, pipeline, fg_bg
+                            )
+                            rendering_fg, _r_fg = rasterize_fg(
+                                means3D=pos_world,
+                                means2D=means2d_input,
+                                shs=None,
+                                colors_precomp=fg_colors,
+                                opacities=fg_opa,
+                                scales=None,
+                                rotations=None,
+                                cov3D_precomp=cov3D_world,
+                            )
+                            cv2_fg = rendering_fg.permute(1, 2, 0).detach().cpu().numpy()
+                            cv2_fg = cv2.cvtColor(cv2_fg, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(
+                                os.path.join(
+                                    flow_gaussian_view_dirs[v_idx],
+                                    f"{out_idx:04d}.png",
+                                ),
+                                np.clip(255.0 * cv2_fg, 0, 255).astype(np.uint8),
+                            )
 
         # 汇总运行参数（供数据集构建与复现）
         if args.output_path is not None:
@@ -1015,17 +1506,66 @@ if __name__ == "__main__":
                 "num_render_views_cli": int(args.num_render_views),
                 "num_render_views_effective": int(nv_effective),
                 "num_render_timesteps_cli": int(args.num_render_timesteps),
+                "render_outputs_per_sim_second": float(
+                    getattr(args, "render_outputs_per_sim_second", 0.0) or 0.0
+                ),
+                "video_compile_framerate": float(video_compile_fps),
                 "render_frame_indices": [int(x) for x in render_frame_indices],
                 "num_render_outputs": int(len(render_frame_indices)),
                 "render_img": bool(args.render_img),
                 "compile_video": bool(args.compile_video),
+                "delete_png_sequences_after_compile_video": bool(
+                    args.delete_png_sequences_after_compile_video
+                ),
                 "output_view_stress_heatmap_requested": bool(
                     args.output_view_stress_heatmap
                 ),
                 "output_view_stress_heatmap_effective": bool(want_stress_heatmap),
-                "output_view_tracks2d_requested": bool(args.output_view_tracks2d),
-                "output_view_tracks2d_effective": bool(want_tracks2d),
-                "view_stress_recompute_before_read": bool(want_stress_heatmap),
+                "output_view_stress_gaussian": bool(want_stress_gaussian),
+                "stress_gaussian_opa_floor": float(args.stress_gaussian_opa_floor),
+                "stress_gaussian_opa_ceil": float(args.stress_gaussian_opa_ceil),
+                "stress_gaussian_sh_blend": float(args.stress_gaussian_sh_blend),
+                "stress_gaussian_colormap_steps": int(args.stress_gaussian_colormap_steps),
+                "stress_gaussian_vm_pct_low": float(args.stress_gaussian_vm_pct_low),
+                "stress_gaussian_vm_pct_high": float(args.stress_gaussian_vm_pct_high),
+                "output_view_flow_gaussian": bool(want_flow_gaussian),
+                "flow_gaussian_max_gaussians": int(args.flow_gaussian_max_gaussians),
+                "flow_gaussian_seed": int(args.flow_gaussian_seed),
+                "flow_gaussian_depth_gamma": float(args.flow_gaussian_depth_gamma),
+                "flow_gaussian_depth_eps": float(args.flow_gaussian_depth_eps),
+                "flow_gaussian_opacity_power": float(args.flow_gaussian_opacity_power),
+                "flow_gaussian_vis_max_motion": float(
+                    args.flow_gaussian_vis_max_motion
+                ),
+                "output_view_tracks_gaussian": bool(want_tracks_gaussian),
+                "tracks_gaussian_max_tracks": int(args.tracks_gaussian_max_tracks),
+                "tracks_gaussian_sigma_scale": float(args.tracks_gaussian_sigma_scale),
+                "tracks_gaussian_point_opacity": float(args.tracks_gaussian_point_opacity),
+                "tracks_gaussian_intensity": float(args.tracks_gaussian_intensity),
+                "tracks_gaussian_seed": int(args.tracks_gaussian_seed),
+                "tracks_gaussian_accum_mode": str(args.tracks_gaussian_accum_mode),
+                "tracks_gaussian_accum_frame_weight": float(
+                    args.tracks_gaussian_accum_frame_weight
+                ),
+                "tracks_gaussian_accum_decay": float(args.tracks_gaussian_accum_decay),
+                "tracks_gaussian_accum_midpoint": bool(
+                    args.tracks_gaussian_accum_midpoint
+                ),
+                "tracks_gaussian_accum_no_normalize_save": bool(
+                    args.tracks_gaussian_accum_no_normalize_save
+                ),
+                "output_subsampled_world_tracks": bool(want_subsampled_world_tracks),
+                "subsampled_tracks_num": int(args.subsampled_tracks_num),
+                "subsampled_tracks_seed": int(args.subsampled_tracks_seed),
+                "subsampled_tracks_ortho_axes": str(
+                    args.subsampled_tracks_ortho_axes
+                ),
+                "subsampled_tracks_video_size": int(
+                    args.subsampled_tracks_video_size
+                ),
+                "view_stress_recompute_before_read": bool(
+                    want_stress_heatmap or want_stress_gaussian
+                ),
                 "output_deformation_volumetric": bool(eff_output_deformation),
                 "output_stress_volumetric": bool(eff_output_stress_vol),
                 "field_output_interval": int(args.field_output_interval),
@@ -1037,50 +1577,146 @@ if __name__ == "__main__":
                 os.path.join(meta_dir, "run_parameters.json"), run_payload
             )
 
-        # 写出各视角 2D 轨迹
-        if want_tracks2d and tracks_root is not None and views:
-            for v_idx, name in enumerate(view_names):
-                buf = track_buffers[v_idx]
-                if buf is not None:
-                    buf.save_npz(os.path.join(tracks_root, f"{name}.npz"))
+        if (
+            want_subsampled_world_tracks
+            and fast_track_xyz_list
+            and args.output_path is not None
+        ):
+            tw_dir = os.path.join(args.output_path, "tracks_subsampled_world")
+            os.makedirs(tw_dir, exist_ok=True)
+            xyz_all = np.stack(fast_track_xyz_list, axis=0)
+            ax_meta = str(args.subsampled_tracks_ortho_axes).strip().lower()
+            np.savez_compressed(
+                os.path.join(tw_dir, "tracks_world.npz"),
+                xyz_world=xyz_all,
+                particle_indices=fast_track_indices_np.astype(np.int64),
+                sim_frames=np.array(fast_track_sim_frames, dtype=np.int32),
+                ortho_axes_preview=ax_meta,
+                description=(
+                    "xyz_world: (T_out,N,3) 世界系；particle_indices: MPM 粒子下标；"
+                    "sim_frames: 仿真步；时间轴与 render_frame_indices / images 一致。"
+                ),
+            )
+            _vprint(f"[modified_simulation] 已写出下采样世界轨迹: {tw_dir}/tracks_world.npz")
 
         # 为每个视角分别合成视频，放在 videos 目录下
-        if args.render_img and args.compile_video and video_root is not None and views:
-            fps = int(1.0 / time_params["frame_dt"])
+        if args.compile_video and video_root is not None:
+            # 与上文一致：N 模式用 render_outputs_per_sim_second；否则按仿真 frame_dt
+            fps = video_compile_fps
             ffmpeg_bin = shutil.which("ffmpeg")
             if ffmpeg_bin is None:
                 print(
                     "[modified_simulation] 未找到 ffmpeg，无法合成视频。"
-                    f"请先安装 ffmpeg，或只用 --render_img 输出图片。期望输出目录: {video_root}"
+                    f"请先安装 ffmpeg，或关闭 --compile_video。期望输出目录: {video_root}"
                 )
             else:
-                for v_idx, (az, el) in enumerate(views):
-                    view_dir = view_dirs[v_idx]
-                    if view_dir is None:
-                        continue
-                    name = f"az{int(round(az))}_el{int(round(el))}"
-                    out_path = os.path.join(video_root, f"{name}.mp4")
-                    in_pattern = os.path.join(view_dir, "%04d.png")
+                def _ffmpeg_png_dir_to_mp4(
+                    in_dir: str, out_mp4: str, vw: int, vh: int
+                ) -> bool:
+                    """成功返回 True；失败返回 False。"""
+                    in_pattern = os.path.join(in_dir, "%04d.png")
                     cmd = [
                         ffmpeg_bin,
                         "-framerate",
-                        str(fps),
+                        str(float(fps)),
                         "-i",
                         in_pattern,
                         "-c:v",
                         "libx264",
                         "-s",
-                        f"{width}x{height}",
+                        f"{int(vw)}x{int(vh)}",
                         "-y",
                         "-pix_fmt",
                         "yuv420p",
-                        out_path,
+                        out_mp4,
                     ]
                     proc = subprocess.run(cmd, capture_output=True, text=True)
                     if proc.returncode != 0:
-                        print(f"[modified_simulation] ffmpeg 合成失败: {out_path}")
+                        print(f"[modified_simulation] ffmpeg 合成失败: {out_mp4}")
                         print(f"[modified_simulation] cmd: {' '.join(cmd)}")
                         if proc.stderr:
                             print(proc.stderr)
-                    else:
-                        print(f"[modified_simulation] 已输出视频: {out_path}")
+                        return False
+                    _vprint(f"[modified_simulation] 已输出视频: {out_mp4}")
+                    if bool(getattr(args, "delete_png_sequences_after_compile_video", False)):
+                        try:
+                            shutil.rmtree(in_dir, ignore_errors=False)
+                            _vprint(
+                                f"[modified_simulation] 已删除 PNG 序列目录: {in_dir}"
+                            )
+                        except OSError as e:
+                            print(
+                                f"[modified_simulation] 删除 PNG 目录失败（保留文件）: "
+                                f"{in_dir} — {e}"
+                            )
+                    return True
+
+                if (
+                    want_subsampled_world_tracks
+                    and fast_track_xyz_list
+                    and args.output_path is not None
+                ):
+                    xyz_all = np.stack(fast_track_xyz_list, axis=0)
+                    tw_dir = os.path.join(args.output_path, "tracks_subsampled_world")
+                    ax = str(args.subsampled_tracks_ortho_axes).strip().lower()
+                    ortho_d = os.path.join(tw_dir, "ortho_frames", ax)
+                    ft_w = max(32, int(args.subsampled_tracks_video_size))
+                    ft_h = ft_w
+                    write_subsampled_world_tracks_ortho_pngs(
+                        xyz_all, ortho_d, ft_w, ft_h, ax
+                    )
+                    out_mp4 = os.path.join(
+                        video_root, f"tracks_subsampled_world_ortho_{ax}.mp4"
+                    )
+                    _ffmpeg_png_dir_to_mp4(ortho_d, out_mp4, ft_w, ft_h)
+
+                if views and width is not None and height is not None:
+                    vw, vh = int(width), int(height)
+                    if args.render_img:
+                        for v_idx, (az, el) in enumerate(views):
+                            view_dir = view_dirs[v_idx]
+                            if view_dir is None:
+                                continue
+                            name = f"az{int(round(az))}_el{int(round(el))}"
+                            out_path = os.path.join(video_root, f"{name}.mp4")
+                            _ffmpeg_png_dir_to_mp4(view_dir, out_path, vw, vh)
+
+                    if want_stress_gaussian:
+                        for v_idx, (az, el) in enumerate(views):
+                            sg_dir = stress_gaussian_view_dirs[v_idx]
+                            if sg_dir is None:
+                                continue
+                            name = f"az{int(round(az))}_el{int(round(el))}"
+                            out_path = os.path.join(
+                                video_root, f"{name}_stress_gaussian.mp4"
+                            )
+                            _ffmpeg_png_dir_to_mp4(sg_dir, out_path, vw, vh)
+
+                    if want_tracks_gaussian:
+                        for v_idx, (az, el) in enumerate(views):
+                            tg_dir = tracks_gaussian_view_dirs[v_idx]
+                            if tg_dir is None:
+                                continue
+                            name = f"az{int(round(az))}_el{int(round(el))}"
+                            out_path = os.path.join(
+                                video_root, f"{name}_tracks_gaussian.mp4"
+                            )
+                            _ffmpeg_png_dir_to_mp4(tg_dir, out_path, vw, vh)
+
+                    if want_flow_gaussian:
+                        for v_idx, (az, el) in enumerate(views):
+                            if v_idx >= len(flow_gaussian_view_dirs):
+                                break
+                            fg_dir = flow_gaussian_view_dirs[v_idx]
+                            if fg_dir is None:
+                                continue
+                            name = f"az{int(round(az))}_el{int(round(el))}"
+                            out_path = os.path.join(
+                                video_root, f"{name}_flow_gaussian.mp4"
+                            )
+                            _ffmpeg_png_dir_to_mp4(fg_dir, out_path, vw, vh)
+                elif views:
+                    print(
+                        "[modified_simulation] 跳过多视角光栅 PNG 的 ffmpeg："
+                        "未能确定 width/height（需至少跑过一帧 3DGS 渲染）。"
+                    )

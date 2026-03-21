@@ -1,7 +1,9 @@
+[2026-03-18] 弃用 `tracks_2d` npz 与 `tracks_2d_flow*` 稀疏/多模式 flow；改为 `output_view_flow_gaussian` + `flow_gaussian_*`，输出 `flow_gaussian/<view>/*.png`，compile 为 `videos/<view>_flow_gaussian.mp4`。runner / transform_dataset / 文档已同步。
+
 [2026-03-20] 完整数据集流水线示例：`configs_auto/train_config_dataset_full.json`、`scripts/run_dataset_pipeline_full.sh`、`rules/dataset_output_pipeline.md`（train_config / transform_dataset 全参数说明）。
 
 [2026-03-20] 数据集含应力热力图与体积场：
-   - `modified_simulation`：默认启用视角应力热力图（`_VIEW_STRESS_HEATMAP_TEMP_DISABLED=False`）；`--output_view_stress_heatmap` + `render_img` 时写入 `stress_heatmaps/<az*_el*>/*.png`，与 RGB 同相机、同 `out_idx`；不依赖事先写出 `stress_field/`（运行时从粒子应力 recompute 后 splat）。
+   - `modified_simulation`：`--output_view_stress_heatmap` 时写入 `stress_heatmaps/<az*_el*>/*.png`；`--output_view_stress_gaussian` 时写入 `stress_gaussian/<view>/*.png`（第二次 3DGS 光栅化）。均与 RGB 同相机、同 `out_idx`；不依赖事先写出 `stress_field/`（运行时 recompute 后读粒子应力）。
    - 体积应力/形变：`train_config` 中 `output_stress` / `output_deformation`，`transform_dataset.py --copy_volumetric_fields` 复制 `stress_field/`、`deformation_field/` 到扁平样本目录。
 
 [2026-03-18] auto_simulation_runner 输出目录改为「每物体下四位数字样本目录」+ `gt_parameters.json`
@@ -26,20 +28,20 @@
 
 1) modified_simulation.py
    - 新增 CLI：--num_render_views（默认 -1 使用 --num_views）、--num_render_timesteps（0=每仿真帧输出）、
-     --output_view_stress_heatmap、--output_view_tracks2d、--no_volumetric_stress_deformation。
-   - 在仿真时间轴上按 num_render_timesteps 均匀选取输出时刻；RGB/应力热力图/2D 轨迹使用同一输出序号 out_idx（0000..K-1）。
+     --output_view_stress_heatmap、--output_view_flow_gaussian（原 tracks_2d 已弃用）、--no_volumetric_stress_deformation。
+   - 在仿真时间轴上按 num_render_timesteps 均匀选取输出时刻；RGB/应力热力图/flow/轨迹等使用同一输出序号 out_idx（0000..K-1）。
    - 应力：对每个视角将 von Mises（Cauchy）标量 splat 为 2D 热力图，可见性由 Gaussian 光栅 radii>0 与屏幕范围决定，不写三维应力体。
-   - 形变轨迹：每视角一个 npz，记录各输出时刻粒子在屏幕上的 UV（不可见为 nan）及 sim_frames。
+   - flow_gaussian：每视角每帧稠密 flow 伪彩 PNG（加权 splat 位移，不写 npz）。
    - means2D 与 means3D 行数不一致时自动补零对齐（修复 sim_area 拼接未选中高斯时可能的维度问题）。
    - meta/run_parameters.json：汇总 material_params、time_params、渲染索引与开关。
    - 修复 ffmpeg 分支错误使用 continue 跳出任务循环的问题，改为 else 包裹合成逻辑。
 
 2) my_utils/view_auxiliary_output.py
-   - 渲染帧索引计算、Cauchy/von Mises、热力图 splat、轨迹缓冲与 npz 写出。
+   - 渲染帧索引计算、Cauchy/von Mises、热力图 splat、flow_gaussian 加权 splat、轨迹 Gaussian 累加等。
 
 3) auto_simulation_runner.py
    - Job 与 train_config 支持：num_render_views、num_render_timesteps、output_view_stress_heatmap、
-     output_view_tracks2d、no_volumetric_stress_deformation，并透传给 modified_simulation。
+     output_view_flow_gaussian、no_volumetric_stress_deformation，并透传给 modified_simulation。
 
 4) rules/dataset_task.txt / rules/dataset_history.txt
    - 记录任务说明与变更历史（本文件）。
@@ -53,15 +55,12 @@
 
 [2026-03-18] transform_dataset.py
    - 新增 `--layout by_model`：输出 `auto_output/<out_name>/<model>/<idx>/`，单样本格式同 dataset_400；`--out_name` 可指定如 dataset_full_test。
-   - 新增 `--copy_aux`：顺带复制 run_parameters.json、stress_heatmaps/、tracks_2d/（若存在）。
+   - 新增 `--copy_aux`：顺带复制 run_parameters.json、stress_heatmaps/、flow_gaussian/ 等（若存在）。
    - train_test 布局逻辑抽成 emit_train_test_layout；manifest 增加 layout、out_name、source_auto_output。
 
 [2026-03-18] 应力热力图 / 体积 stress 导出：每子步 g2p 会更新 F_trial，而 particle_stress 仍为本子步初由旧 F_trial 算出的值；在关键帧读 Cauchy/von Mises 前须调用
    `MPM_Simulator_WARP.recompute_particle_stress_from_F_trial(substep_dt)`（与同步子步开头的应力核一致）。
    modified_simulation：渲染采样帧、save_stress_field 间隔、以及初始 frame0 体积导出前均增加该刷新；view_auxiliary_output 文档说明调用约定。
-   tracks_2d：`_VIEW_TRACKS2D_TEMP_DISABLED=True` 时忽略 `--output_view_tracks2d`。
-   应力热力图：`_VIEW_STRESS_HEATMAP_TEMP_DISABLED=True`（默认）时忽略 `--output_view_stress_heatmap`，便于排查推理速度；与轨迹开关均在 modified_simulation.py 顶部。
-
 [2026-03-18] 现象：tqdm 长期停在 0/N、「No cameras.json」出现多次。
    原因分析（非 bug）：
    1) tqdm 按「整仿真帧」更新；0% 表示第 0 帧尚未结束。该帧内要先跑完 `step_per_frame = frame_dt/substep_dt` 次 MPM `p2g2p`，子步多时会很久。

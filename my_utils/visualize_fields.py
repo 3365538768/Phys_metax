@@ -21,6 +21,8 @@ if not os.environ.get("XDG_RUNTIME_DIR"):
 import open3d as o3d
 from open3d.visualization import rendering
 
+from my_utils.sim_utils import mpm_positions_to_world_numpy
+
 
 # =====================================
 # IO
@@ -65,25 +67,6 @@ def load_stress_frames(folder):
     return frames
 
 
-def mpm_positions_to_world_numpy(pos, spec):
-    """
-    与 modified_simulation 中 pos_world = undo_all_transforms(particle_x) 一致。
-    deformation_field / stress_field 里存的是 MPM 空间坐标；3DGS 渲染用世界坐标。
-    """
-    if spec is None:
-        return np.asarray(pos, dtype=np.float64)
-    x = np.asarray(pos, dtype=np.float64).reshape(-1, 3).copy()
-    x -= np.array([1.0, 1.0, 1.0], dtype=np.float64)
-    scale = float(spec["scale_origin"])
-    om = np.asarray(spec["original_mean_pos"], dtype=np.float64).reshape(3)
-    x = om + x / scale
-    mats = spec.get("rotation_matrices") or []
-    for mi in range(len(mats) - 1, -1, -1):
-        R = np.asarray(mats[mi], dtype=np.float64).reshape(3, 3)
-        x = x @ R
-    return x
-
-
 def deformation_frames_to_world_positions(frames, spec):
     """返回新帧列表（dict），position 为世界系；其它键原样复制。"""
     if spec is None:
@@ -109,12 +92,40 @@ def observant_matrix_from_world_up(world_up):
     return np.column_stack((h1, h2, wu))
 
 
-def try_load_stress_pcd_meta(simulation_dir):
-    p = os.path.join(simulation_dir, "meta", "stress_pcd_cameras.json")
-    if not os.path.isfile(p):
-        return None
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+def infer_images_render_size(simulation_dir, camera_meta=None):
+    """
+    从 simulation_dir/images/<视角>/0000.png（或 0001…）读取与 3DGS 输出一致的分辨率，
+    避免默认 1280x960 与 synthetic 800x800 导致视场/「距离感」不一致。
+    """
+    root = os.path.join(simulation_dir, "images")
+    fb_w, fb_h = 800, 800
+    if camera_meta:
+        fb_w = int(camera_meta.get("width_hint", 800))
+        fb_h = int(camera_meta.get("height_hint", 800))
+    if not os.path.isdir(root):
+        return fb_w, fb_h
+    subdirs = sorted(
+        d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))
+    )
+    for sd in subdirs:
+        for name in (
+            "0000.png",
+            "0001.png",
+            "0002.png",
+            "0003.png",
+            "0004.png",
+        ):
+            p = os.path.join(root, sd, name)
+            if not os.path.isfile(p):
+                continue
+            im = cv2.imread(p)
+            if im is None:
+                continue
+            h, w = im.shape[:2]
+            w = max(2, w // 2 * 2)
+            h = max(2, h // 2 * 2)
+            return int(w), int(h)
+    return fb_w, fb_h
 
 
 # =====================================
@@ -132,6 +143,43 @@ def von_mises(stress):
     vm = np.sqrt(1.5 * np.sum(dev*dev,(1,2)))
 
     return vm
+
+
+def global_log_stress_range(stress_frames_list, eps=1e-8, robust_pct=None):
+    """
+    全时段 von Mises → log 后的范围。默认 [min,max]；robust_pct=(low, high) 时用分位数抗离群。
+    """
+    chunks = []
+    for sf in stress_frames_list:
+        vm = von_mises(sf["stress_cauchy"])
+        chunks.append(np.log(np.maximum(vm.astype(np.float64), eps)))
+    all_log = np.concatenate(chunks, axis=0)
+    all_log = np.asarray(all_log[np.isfinite(all_log)], dtype=np.float64)
+    if all_log.size == 0:
+        return 0.0, 1.0
+    if robust_pct is not None:
+        lo, hi = float(robust_pct[0]), float(robust_pct[1])
+        vmin = float(np.percentile(all_log, lo))
+        vmax = float(np.percentile(all_log, hi))
+    else:
+        vmin = float(np.min(all_log))
+        vmax = float(np.max(all_log))
+    if vmax <= vmin + 1e-12:
+        vmax = vmin + 1.0
+    return vmin, vmax
+
+
+def log_stress_to_colors_rgb(log_vm, vmin, vmax):
+    """
+    将已取 log 的标量映射为 RGB（0~1），用 OpenCV TURBO/JET 增强对比度。
+    """
+    t = (log_vm.astype(np.float64) - vmin) / (vmax - vmin + 1e-12)
+    t = np.clip(t, 0.0, 1.0)
+    u8 = (t * 255.0).astype(np.uint8).reshape(-1, 1)
+    cmap = getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
+    bgr = cv2.applyColorMap(u8, cmap).reshape(-1, 3).astype(np.float64) / 255.0
+    rgb = bgr[:, ::-1].copy()
+    return rgb
 
 
 # =====================================
@@ -187,6 +235,28 @@ def create_trajectory_lines(all_pos):
     return ls
 
 
+def create_trajectory_lines_subsampled(
+    all_pos,
+    max_tracks=4000,
+    seed=0,
+):
+    """
+    下采样粒子后再连时序折线，避免全粒子轨迹过密（参考早期「可看清单条轨迹」的思路）。
+    all_pos: (T, N, 3)
+    """
+    T, N, _ = all_pos.shape
+    n_tr = min(int(max_tracks), int(N))
+    if n_tr <= 0:
+        n_tr = min(N, 1)
+    rng = np.random.default_rng(int(seed))
+    if n_tr >= N:
+        inds = np.arange(N, dtype=np.int64)
+    else:
+        inds = np.sort(rng.choice(N, size=n_tr, replace=False))
+    sub = all_pos[:, inds, :]
+    return create_trajectory_lines(sub)
+
+
 # =====================================
 # stress video
 # =====================================
@@ -200,6 +270,7 @@ def render_stress_video(
     compose_video=True,
     world_up=None,
     fov_vertical_deg=60.0,
+    stress_robust_pct=None,
 ):
 
     if compose_video:
@@ -220,21 +291,13 @@ def render_stress_video(
 
     T = min(len(deformation_frames),len(stress_frames))
 
-    # global stress range
-    all_vm=[]
-
-    for i in range(T):
-
-        vm = von_mises(stress_frames[i]["stress_cauchy"])
-
-        all_vm.append(vm)
-
-    all_vm=np.concatenate(all_vm)
-
-    all_vm=np.log(all_vm+1e-6)
-
-    vmin=np.percentile(all_vm,1)
-    vmax=np.percentile(all_vm,99)
+    vmin, vmax = global_log_stress_range(
+        stress_frames[:T], eps=1e-8, robust_pct=stress_robust_pct
+    )
+    print(
+        f"[visualize_fields] 单视角应力 log(von Mises) 映射: "
+        f"min={vmin:.6g}, max={vmax:.6g} (分位数={stress_robust_pct})"
+    )
 
     renderer = rendering.OffscreenRenderer(width,height)
 
@@ -266,7 +329,7 @@ def render_stress_video(
 
     mat=rendering.MaterialRecord()
     mat.shader="defaultUnlit"
-    mat.point_size=6
+    mat.point_size = max(2.0, float(6 * (width / 800.0)))
 
     for i in tqdm(range(T)):
 
@@ -279,13 +342,9 @@ def render_stress_video(
 
         vm=von_mises(stress)
 
-        vm=np.log(vm+1e-6)
+        vm=np.log(np.maximum(vm.astype(np.float64),1e-8))
 
-        col=(vm-vmin)/(vmax-vmin+1e-8)
-
-        col=np.clip(col,0,1)
-
-        colors=np.stack([col,np.zeros_like(col),1-col],axis=1)
+        colors=log_stress_to_colors_rgb(vm, vmin, vmax)
 
         pcd=create_point_cloud(pos,colors)
 
@@ -365,7 +424,8 @@ def _apply_o3d_camera_from_meta(scene, look_at, eye, up, width, height, fov_vert
 
     fov = float(fov_vertical_deg)
 
-    near_v, far_v = 0.1, 100.0
+    # 与 gaussian-splatting scene/cameras 中 znear/zfar 大致一致
+    near_v, far_v = 0.01, 100.0
 
     for attr in ("Fov", "FovType"):
 
@@ -433,6 +493,7 @@ def render_stress_video_multiview(
     compose_video=True,
     deformation_folder=None,
     mpm_fallback_camera=False,
+    stress_robust_pct=None,
 ):
 
     """
@@ -495,21 +556,13 @@ def render_stress_video_multiview(
 
     T = min(len(deformation_frames), len(stress_frames))
 
-    all_vm = []
-
-    for i in range(T):
-
-        vm = von_mises(stress_frames[i]["stress_cauchy"])
-
-        all_vm.append(vm)
-
-    all_vm = np.concatenate(all_vm)
-
-    all_vm = np.log(all_vm + 1e-6)
-
-    vmin = np.percentile(all_vm, 1)
-
-    vmax = np.percentile(all_vm, 99)
+    vmin, vmax = global_log_stress_range(
+        stress_frames[:T], eps=1e-8, robust_pct=stress_robust_pct
+    )
+    print(
+        f"[visualize_fields] 多视角应力 log(von Mises) 映射: "
+        f"min={vmin:.6g}, max={vmax:.6g} (分位数={stress_robust_pct})"
+    )
 
     if deformation_folder and os.path.isdir(deformation_folder):
 
@@ -552,7 +605,7 @@ def render_stress_video_multiview(
 
     mat.shader = "defaultUnlit"
 
-    mat.point_size = 6
+    mat.point_size = max(2.0, float(6 * (float(width) / 800.0)))
 
     renderer = rendering.OffscreenRenderer(width, height)
 
@@ -608,16 +661,9 @@ def render_stress_video_multiview(
 
                 vm = von_mises(stress)
 
-                vm = np.log(vm + 1e-6)
+                vm = np.log(np.maximum(vm.astype(np.float64), 1e-8))
 
-                col = (vm - vmin) / (vmax - vmin + 1e-8)
-
-                col = np.clip(col, 0, 1)
-
-                colors = np.stack(
-                    [col, np.zeros_like(col), 1 - col],
-                    axis=1,
-                )
+                colors = log_stress_to_colors_rgb(vm, vmin, vmax)
 
                 pcd = create_point_cloud(pos, colors)
 
@@ -690,6 +736,9 @@ def render_trajectory_video(
     compose_video=True,
     world_up=None,
     fov_vertical_deg=60.0,
+    max_tracks=4000,
+    traj_seed=0,
+    show_points=False,
 ):
 
     if compose_video:
@@ -717,7 +766,15 @@ def render_trajectory_video(
     for i,f in enumerate(frames):
         all_pos[i]=f["position"]
 
-    traj=create_trajectory_lines(all_pos)
+    traj = create_trajectory_lines_subsampled(
+        all_pos, max_tracks=max_tracks, seed=traj_seed
+    )
+    n_lines = int(traj.lines.shape[0])
+    n_sub = n_lines // max(T - 1, 1) if T > 1 else 0
+    print(
+        f"[visualize_fields] 轨迹: 下采样 {n_sub} 条粒子时序折线 / 总粒子 {N} "
+        f"(max_tracks={max_tracks}, show_points={show_points})"
+    )
 
     renderer=rendering.OffscreenRenderer(width,height)
 
@@ -753,22 +810,24 @@ def render_trajectory_video(
 
     scene.add_geometry("traj",traj,mat_line)
 
-    for i,f in enumerate(tqdm(frames)):
+    for i,f in enumerate(tqdm(frames, desc="trajectory")):
 
-        if scene.has_geometry("pcd"):
-            scene.remove_geometry("pcd")
+        if show_points:
 
-        pos=f["position"]
+            if scene.has_geometry("pcd"):
+                scene.remove_geometry("pcd")
 
-        colors=np.ones_like(pos)*0.8
+            pos=f["position"]
 
-        pcd=create_point_cloud(pos,colors)
+            colors=np.ones_like(pos)*0.8
 
-        mat=rendering.MaterialRecord()
-        mat.shader="defaultUnlit"
-        mat.point_size=3
+            pcd=create_point_cloud(pos,colors)
 
-        scene.add_geometry("pcd",pcd,mat)
+            mat=rendering.MaterialRecord()
+            mat.shader="defaultUnlit"
+            mat.point_size=3
+
+            scene.add_geometry("pcd",pcd,mat)
 
         img=renderer.render_to_image()
 
@@ -859,6 +918,52 @@ if __name__=="__main__":
         help="多视角应力：额外合成 mp4（默认多视角只写 PNG，避免段错误；须与 --multiview 同用）",
     )
 
+    parser.add_argument(
+        "--no_match_images_size",
+        action="store_true",
+        help="不根据 simulation_dir/images/ 下的 PNG 推断分辨率，始终用 --width/--height",
+    )
+
+    parser.add_argument(
+        "--stress_vmin_pct",
+        type=float,
+        default=None,
+        help="与 --stress_vmax_pct 同时指定时，log(σ_vm) 用分位数范围染色（抗离群）；否则用全局 min/max",
+    )
+
+    parser.add_argument(
+        "--stress_vmax_pct",
+        type=float,
+        default=None,
+        help="见 --stress_vmin_pct，例如 1 与 99",
+    )
+
+    parser.add_argument(
+        "--traj_max_tracks",
+        type=int,
+        default=4000,
+        help="轨迹线下采样的粒子条数上限（默认 4000）",
+    )
+
+    parser.add_argument(
+        "--traj_seed",
+        type=int,
+        default=0,
+        help="轨迹下采样随机种子",
+    )
+
+    parser.add_argument(
+        "--traj_show_points",
+        action="store_true",
+        help="每帧叠加全体粒子点云（默认仅显示下采样后的时序折线）",
+    )
+
+    parser.add_argument(
+        "--trajectory",
+        action="store_true",
+        help="应力可视化完成后额外渲染 deformation_trajectory 视频（默认关闭）",
+    )
+
     args = parser.parse_args()
 
     if args.multiview:
@@ -940,18 +1045,38 @@ if __name__=="__main__":
             "多视角将使用 MPM 系相机回退。"
         )
 
+    render_w, render_h = int(args.width), int(args.height)
+    img_root = os.path.join(args.simulation_dir, "images")
+    if (not args.no_match_images_size) and os.path.isdir(img_root):
+        iw, ih = infer_images_render_size(args.simulation_dir, camera_meta)
+        render_w, render_h = iw, ih
+        print(
+            f"[visualize_fields] 使用与 images/ 一致的分辨率: {render_w}x{render_h} "
+            f"（勿与 3DGS 输出尺寸混用可加 --no_match_images_size）"
+        )
+
+    stress_robust = None
+    if args.stress_vmin_pct is not None and args.stress_vmax_pct is not None:
+        stress_robust = (float(args.stress_vmin_pct), float(args.stress_vmax_pct))
+    elif args.stress_vmin_pct is not None or args.stress_vmax_pct is not None:
+        print(
+            "[visualize_fields] 警告: 需同时指定 --stress_vmin_pct 与 --stress_vmax_pct 才启用分位数范围，"
+            "否则仍用 log 应力全局 min/max。"
+        )
+
     if args.multiview:
 
         render_stress_video_multiview(
             deformation_frames,
             stress_frames,
             args.output_path,
-            args.width,
-            args.height,
+            render_w,
+            render_h,
             camera_meta,
             compose_video=compose_multiview,
             deformation_folder=deformation_folder,
             mpm_fallback_camera=mpm_fallback_mv,
+            stress_robust_pct=stress_robust,
         )
 
     else:
@@ -960,19 +1085,24 @@ if __name__=="__main__":
             deformation_frames,
             stress_frames,
             args.output_path,
-            args.width,
-            args.height,
+            render_w,
+            render_h,
             compose_video=compose_single_and_traj,
             world_up=world_up_vis,
             fov_vertical_deg=fov_gs,
+            stress_robust_pct=stress_robust,
         )
 
-    render_trajectory_video(
-        deformation_frames,
-        args.output_path,
-        args.width,
-        args.height,
-        compose_video=compose_single_and_traj,
-        world_up=world_up_vis,
-        fov_vertical_deg=fov_gs,
-    )
+    if args.trajectory:
+        render_trajectory_video(
+            deformation_frames,
+            args.output_path,
+            render_w,
+            render_h,
+            compose_video=compose_single_and_traj,
+            world_up=world_up_vis,
+            fov_vertical_deg=fov_gs,
+            max_tracks=int(args.traj_max_tracks),
+            traj_seed=int(args.traj_seed),
+            show_points=bool(args.traj_show_points),
+        )

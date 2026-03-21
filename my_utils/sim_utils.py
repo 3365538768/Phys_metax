@@ -680,3 +680,25 @@ def write_stress_pcd_camera_meta_json(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
+
+def mpm_positions_to_world_numpy(
+    pos: np.ndarray, spec: Optional[Dict]
+) -> np.ndarray:
+    """
+    与 modified_simulation 中 pos_world = undo_all_transforms(particle_x) 一致。
+    deformation_field / stress_field 里存 MPM 空间坐标；3DGS / 可视化用世界系。
+    spec 为 meta 中 mpm_to_world（rotation_matrices, scale_origin, original_mean_pos）。
+    """
+    if spec is None:
+        return np.asarray(pos, dtype=np.float64)
+    x = np.asarray(pos, dtype=np.float64).reshape(-1, 3).copy()
+    x -= np.array([1.0, 1.0, 1.0], dtype=np.float64)
+    scale = float(spec["scale_origin"])
+    om = np.asarray(spec["original_mean_pos"], dtype=np.float64).reshape(3)
+    x = om + x / scale
+    mats = spec.get("rotation_matrices") or []
+    for mi in range(len(mats) - 1, -1, -1):
+        R = np.asarray(mats[mi], dtype=np.float64).reshape(3, 3)
+        x = x @ R
+    return x
+

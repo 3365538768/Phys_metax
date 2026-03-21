@@ -45,5 +45,5 @@ python transform_dataset.py \
 echo ""
 echo "完成: $AUTO_OUT/$OUT_NAME"
 echo "  train/ test/ 下每样本含: images/, gt.json, boundary_conditions.json"
-echo "  --copy_aux: run_parameters.json, stress_heatmaps/, tracks_2d/（若仿真已生成）"
+echo "  --copy_aux: run_parameters.json, stress_heatmaps/, flow_gaussian/（若仿真已生成）"
 echo "  --copy_volumetric_fields: stress_field/, deformation_field/（若仿真已生成）"

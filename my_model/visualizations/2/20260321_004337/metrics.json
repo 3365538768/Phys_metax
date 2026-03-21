@@ -1,0 +1,20 @@
+{
+  "arch": 2,
+  "data_layout": "dataset_400",
+  "dataset_dir": "dataset_400",
+  "checkpoint": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/my_model/checkpoints/2/final__T100_H224_bs8_lr0.0001_ep500_seed42_dataset_400.pt",
+  "n_test": 87,
+  "mae": {
+    "E": 189910.546875,
+    "nu": 0.3541264235973358,
+    "density": 1583.4644775390625,
+    "yield_stress": 96531.9296875
+  },
+  "mape_pct": {
+    "E": 860.2261352539062,
+    "nu": 100.0,
+    "density": 118.41290283203125,
+    "yield_stress": 448.0288391113281
+  },
+  "action_acc_pct": 37.93103448275862
+}
