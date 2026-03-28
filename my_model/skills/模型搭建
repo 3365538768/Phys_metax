@@ -1,0 +1,49 @@
+# 模型搭建技能规范
+
+## 目标
+- 构建可训练、可解释、可扩展的多任务模型（参数回归 + 场预测 + 受力相关任务）。
+- 明确输入张量格式、主干网络、任务头、损失对齐关系，避免后期反复改接口。
+
+## 适用场景
+- 新建模型架构。
+- 替换 backbone 或新增任务头。
+- 从单任务改为多任务监督。
+
+## 输入与输出约定
+- 输入统一为 `rgb: [B, V, C, T, H, W]`（若只支持单视角，内部固定 `V=1`）。
+- 中间特征统一为 `feat: [B, V, D]` 或 `feat_map: [B, V, D, T', H', W']
+- 输出建议至少包含：
+  - `param_pred`: 物理参数回归（如 `E, nu, density, yield_stress`）。
+  - `field_pred`: 时空场预测（如 `stress/flow`）。
+  - `force_pred`: 受力相关预测（如 `force_map/force_dir`）。
+
+## 设计流程（必须按顺序）
+1. 定义任务字典：列出每个任务的 `target shape`、损失函数、默认权重。
+2. 定义 backbone：明确 patch/tubelet 设定与输入时空维度对应关系。
+3. 定义融合层：多视角时使用 attention 或 pooling，并给出默认策略。
+4. 定义 heads：每个任务独立 head，禁止不同任务共享最后一层输出。
+5. 定义 forward 返回结构：必须返回 `dict[str, Tensor]`，键名稳定。
+6. 增加 shape assert：在 forward 早期对关键维度做断言。
+
+## 质量门禁
+- 同一 batch 内所有任务输出都必须可用（禁止某任务返回 `None`）。
+- 任意任务开关关闭后，forward 仍可正常运行。
+- 单卡与多卡下 forward 输出键集合一致。
+- 提供最小 dry-run：随机输入可完成前向+反向。
+
+## 常见错误与规避
+- 错误：`[T,C,H,W]` 与 `[C,T,H,W]` 混用。  
+  规避：统一在 dataset 层归一化，模型内只接受一种格式。
+- 错误：多任务共用同一输出层导致梯度冲突。  
+  规避：任务头解耦，必要时加梯度平衡策略。
+- 错误：配置项过多但无默认值。  
+  规避：所有关键超参必须在 config 有默认值并附注释。
+
+## 交付物模板
+- `arch_*.py`: 模型结构。
+- `staged_model.py`: 任务编排与阶段冻结策略。
+- `tests/smoke_model.py`: 输入输出 shape 与反向传播 smoke test。
+
+参考backbone
+VideoMAE
+MViT

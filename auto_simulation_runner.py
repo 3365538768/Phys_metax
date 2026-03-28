@@ -240,6 +240,9 @@ class Job:
     output_layout: str  # by_model | by_action
     num_views: int
     num_render_views: int  # -1 表示与 num_views 相同
+    random_render_views: bool
+    random_render_views_min_gap_deg: float
+    random_render_views_seed: int
     num_render_timesteps: int  # 0 表示每仿真帧都输出渲染/视角辅助
     render_outputs_per_sim_second: float  # >0 时覆盖为「每秒仿真时长 N 张」均匀采样 + 视频帧率
     render_img: bool
@@ -253,6 +256,8 @@ class Job:
     stress_gaussian_vm_pct_low: float
     stress_gaussian_vm_pct_high: float
     output_view_flow_gaussian: bool
+    output_view_object_mask: bool
+    output_view_force_mask: bool
     flow_gaussian_max_gaussians: int
     flow_gaussian_seed: int
     flow_gaussian_depth_gamma: float
@@ -279,6 +284,19 @@ class Job:
     field_output_interval: int
     output_bc_info: bool
     output_force_info: bool
+    output_initial_force_mask_arrow: bool
+    pack_arch4_tensors: bool
+    pack_arch4_lmdb: bool
+    pack_arch4_lmdb_include_object_mask: bool
+    arch4_lmdb_resize: int
+    arch4_lmdb_map_size_gb: float
+    arch4_lmdb_name: str
+    compress_render_pngs: bool
+    png_compression_level: int
+    render_export_max_side: int
+    render_export_scale: float
+    camera_distance_scale: float
+    arch4_tensor_dtype: str
     white_bg: bool
     debug: bool
     # 非 None 时：样本写到 output_root/dataset_name/[dataset_split]/000000/（6 位），并写 gt.json
@@ -312,6 +330,11 @@ def _build_job_list(
     # 渲染视角数：默认同 num_views；可单独设 num_render_views（与 rules/dataset_task 对齐）
     nr_v = train_cfg.get("num_render_views", None)
     num_render_views = int(nr_v) if nr_v is not None else -1
+    random_render_views = bool(train_cfg.get("random_render_views", False))
+    random_render_views_min_gap_deg = float(
+        train_cfg.get("random_render_views_min_gap_deg", 20.0)
+    )
+    random_render_views_seed = int(train_cfg.get("random_render_views_seed", 0))
     num_render_timesteps = int(train_cfg.get("num_render_timesteps", 0))
     render_outputs_per_sim_second = float(
         train_cfg.get("render_outputs_per_sim_second", 0.0) or 0.0
@@ -349,6 +372,8 @@ def _build_job_list(
     output_view_flow_gaussian = bool(
         train_cfg.get("output_view_flow_gaussian", False)
     )
+    output_view_object_mask = bool(train_cfg.get("output_view_object_mask", False))
+    output_view_force_mask = bool(train_cfg.get("output_view_force_mask", False))
     flow_gaussian_max_gaussians = int(
         train_cfg.get("flow_gaussian_max_gaussians", 8192)
     )
@@ -412,6 +437,39 @@ def _build_job_list(
     field_output_interval = int(train_cfg.get("field_output_interval", 1))
     output_bc_info = bool(train_cfg.get("output_bc_info", True))
     output_force_info = bool(train_cfg.get("output_force_info", True))
+    output_initial_force_mask_arrow = bool(
+        train_cfg.get("output_initial_force_mask_arrow", False)
+    )
+    pack_arch4_lmdb = bool(train_cfg.get("pack_arch4_lmdb", False))
+    pack_arch4_lmdb_include_object_mask = bool(
+        train_cfg.get("pack_arch4_lmdb_include_object_mask", True)
+    )
+    pack_arch4_tensors = bool(train_cfg.get("pack_arch4_tensors", True)) and (
+        not pack_arch4_lmdb
+    )
+    compress_render_pngs = bool(train_cfg.get("compress_render_pngs", True))
+    png_compression_level = max(
+        0, min(9, int(train_cfg.get("png_compression_level", 6)))
+    )
+    render_export_max_side = max(0, int(train_cfg.get("render_export_max_side", 0) or 0))
+    _res_scale = float(train_cfg.get("render_export_scale", 1.0) or 1.0)
+    render_export_scale = _res_scale if _res_scale > 0.0 else 1.0
+    _cam_dist_scale = float(train_cfg.get("camera_distance_scale", 1.0) or 1.0)
+    camera_distance_scale = _cam_dist_scale if _cam_dist_scale > 0.0 else 1.0
+    _adtp = str(train_cfg.get("arch4_tensor_dtype", "float32")).strip().lower()
+    if _adtp in ("fp16", "half"):
+        _adtp = "float16"
+    if _adtp in ("bf16",):
+        _adtp = "bfloat16"
+    if _adtp not in ("float32", "float16", "bfloat16"):
+        _adtp = "float32"
+    arch4_tensor_dtype = _adtp
+    arch4_lmdb_resize = max(8, int(train_cfg.get("arch4_lmdb_resize", 224)))
+    arch4_lmdb_map_size_gb = max(0.25, float(train_cfg.get("arch4_lmdb_map_size_gb", 8.0)))
+    _lmn = str(train_cfg.get("arch4_lmdb_name", "arch4_data.lmdb")).strip() or "arch4_data.lmdb"
+    arch4_lmdb_name = _lmn.replace("/", "_").replace("\\", "_").strip()
+    if not arch4_lmdb_name or arch4_lmdb_name in (".", ".."):
+        arch4_lmdb_name = "arch4_data.lmdb"
     white_bg = bool(train_cfg.get("white_bg", False))
     debug = bool(train_cfg.get("debug", False))
 
@@ -447,6 +505,9 @@ def _build_job_list(
                 output_layout=output_layout,
                 num_views=num_views,
                 num_render_views=num_render_views,
+                random_render_views=random_render_views,
+                random_render_views_min_gap_deg=random_render_views_min_gap_deg,
+                random_render_views_seed=random_render_views_seed,
                 num_render_timesteps=num_render_timesteps,
                 render_outputs_per_sim_second=render_outputs_per_sim_second,
                 render_img=render_img,
@@ -460,6 +521,8 @@ def _build_job_list(
                 stress_gaussian_vm_pct_low=stress_gaussian_vm_pct_low,
                 stress_gaussian_vm_pct_high=stress_gaussian_vm_pct_high,
                 output_view_flow_gaussian=output_view_flow_gaussian,
+                output_view_object_mask=output_view_object_mask,
+                output_view_force_mask=output_view_force_mask,
                 flow_gaussian_max_gaussians=flow_gaussian_max_gaussians,
                 flow_gaussian_seed=flow_gaussian_seed,
                 flow_gaussian_depth_gamma=flow_gaussian_depth_gamma,
@@ -486,6 +549,19 @@ def _build_job_list(
                 field_output_interval=field_output_interval,
                 output_bc_info=output_bc_info,
                 output_force_info=output_force_info,
+                output_initial_force_mask_arrow=output_initial_force_mask_arrow,
+                pack_arch4_tensors=pack_arch4_tensors,
+                pack_arch4_lmdb=pack_arch4_lmdb,
+                pack_arch4_lmdb_include_object_mask=pack_arch4_lmdb_include_object_mask,
+                arch4_lmdb_resize=arch4_lmdb_resize,
+                arch4_lmdb_map_size_gb=arch4_lmdb_map_size_gb,
+                arch4_lmdb_name=arch4_lmdb_name,
+                compress_render_pngs=compress_render_pngs,
+                png_compression_level=png_compression_level,
+                render_export_max_side=render_export_max_side,
+                render_export_scale=render_export_scale,
+                camera_distance_scale=camera_distance_scale,
+                arch4_tensor_dtype=arch4_tensor_dtype,
                 white_bg=white_bg,
                 debug=debug,
                 dataset_name=dataset_name,
@@ -567,6 +643,53 @@ def _material_params_to_str_dict(mp: Dict[str, Any]) -> Dict[str, str]:
     return {str(k): str(v) for k, v in mp.items()}
 
 
+def _build_gt_json_inline(
+    object_name: str,
+    action: str,
+    params: Dict[str, str],
+    *,
+    sim_types_ref: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    内置版 gt.json 构造逻辑（避免依赖 transform_dataset.py）。
+
+    字段尽量对齐历史 dataset_deformation_stress_500 的格式：
+    - object / action / action_index
+    - params（字符串）
+    - regression（E/nu/density/yield_stress 的 float）
+    """
+    # action_index：优先按当前配置里的 sim_types 顺序；否则回退默认顺序
+    sim_types = list(sim_types_ref or ["bend", "drop", "press", "shear", "stretch"])
+    action_l = str(action).strip().lower()
+    if action_l in sim_types:
+        action_index = int(sim_types.index(action_l))
+    else:
+        action_index = -1
+
+    def _to_float_or_none(v: Any) -> Optional[float]:
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    reg = {
+        "E": _to_float_or_none(params.get("E", None)),
+        "nu": _to_float_or_none(params.get("nu", None)),
+        "density": _to_float_or_none(params.get("density", None)),
+        "yield_stress": _to_float_or_none(params.get("yield_stress", None)),
+    }
+
+    return {
+        "object": str(object_name),
+        "action": str(action),
+        "action_index": int(action_index),
+        "params": dict(params),
+        "regression": reg,
+    }
+
+
 def _write_gt_json_dataset_layout(
     out_dir: str,
     job: Job,
@@ -579,11 +702,14 @@ def _write_gt_json_dataset_layout(
     与 transform_dataset 产出的 dataset_400/train/000000/gt.json 字段对齐，
     并附加 dataset 元信息，便于后续划分 train/test 或统一训练。
     """
-    from transform_dataset import build_gt_json
-
     ply_stem = os.path.splitext(os.path.basename(job.ply_path))[0]
     params_str = _material_params_to_str_dict(job.material_params)
-    gt: Dict[str, Any] = build_gt_json(ply_stem, job.sim_type, params_str)
+    gt: Dict[str, Any] = _build_gt_json_inline(
+        ply_stem,
+        job.sim_type,
+        params_str,
+        sim_types_ref=["bend", "drop", "press", "shear", "stretch"],
+    )
     gt["sample_index"] = int(sample_index)
     gt["job_index"] = int(job_index)
     gt["train_seed"] = int(train_seed)
@@ -715,9 +841,11 @@ def run() -> None:
             path_idx = _next_sample_index(job)
         out_dir = _job_output_dir(job, path_idx)
         os.makedirs(out_dir, exist_ok=True)
-        _write_gt_parameters_json(
-            out_dir, job, idx, sample_index_for_output=path_idx
-        )
+        # 命名数据集布局下统一使用 gt.json，避免与 gt_parameters.json 重复。
+        if not job.dataset_name:
+            _write_gt_parameters_json(
+                out_dir, job, idx, sample_index_for_output=path_idx
+            )
         if job.dataset_name:
             _write_gt_json_dataset_layout(
                 out_dir,
@@ -746,9 +874,15 @@ def run() -> None:
             str(job.num_views),
             "--num_render_views",
             str(job.num_render_views),
+            "--random_render_views_min_gap_deg",
+            str(job.random_render_views_min_gap_deg),
+            "--random_render_views_seed",
+            str(job.random_render_views_seed),
             "--num_render_timesteps",
             str(job.num_render_timesteps),
         ]
+        if job.random_render_views:
+            cmd.append("--random_render_views")
         if float(job.render_outputs_per_sim_second) > 0.0:
             cmd.extend(
                 [
@@ -804,6 +938,10 @@ def run() -> None:
                     str(job.flow_gaussian_vis_max_motion),
                 ]
             )
+        if job.output_view_object_mask:
+            cmd.append("--output_view_object_mask")
+        if job.output_view_force_mask:
+            cmd.append("--output_view_force_mask")
         if job.output_view_tracks_gaussian:
             cmd.append("--output_view_tracks_gaussian")
             cmd.extend(
@@ -850,6 +988,48 @@ def run() -> None:
             cmd.append("--output_bc_info")
         if job.output_force_info:
             cmd.append("--output_force_info")
+        if job.output_initial_force_mask_arrow:
+            cmd.append("--output_initial_force_mask_arrow")
+        if job.pack_arch4_lmdb:
+            cmd.append("--pack_arch4_lmdb")
+            cmd.extend(
+                [
+                    "--arch4_lmdb_resize",
+                    str(int(job.arch4_lmdb_resize)),
+                    "--arch4_lmdb_map_size_gb",
+                    str(float(job.arch4_lmdb_map_size_gb)),
+                    "--arch4_lmdb_name",
+                    str(job.arch4_lmdb_name),
+                ]
+            )
+            if job.pack_arch4_lmdb_include_object_mask:
+                cmd.append("--pack_arch4_lmdb_include_object_mask")
+        if job.pack_arch4_tensors:
+            cmd.append("--pack_arch4_tensors")
+            cmd.extend(
+                [
+                    "--arch4_tensor_dtype",
+                    str(job.arch4_tensor_dtype),
+                ]
+            )
+        if not job.compress_render_pngs:
+            cmd.append("--no_compress_render_pngs")
+        cmd.extend(
+            [
+                "--png_compression_level",
+                str(int(job.png_compression_level)),
+            ]
+        )
+        cmd.extend(
+            [
+                "--render_export_max_side",
+                str(int(job.render_export_max_side)),
+                "--render_export_scale",
+                str(float(job.render_export_scale)),
+                "--camera_distance_scale",
+                str(float(job.camera_distance_scale)),
+            ]
+        )
         if job.white_bg:
             cmd.append("--white_bg")
         if job.debug:

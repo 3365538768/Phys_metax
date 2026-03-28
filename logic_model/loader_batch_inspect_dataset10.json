@@ -1,0 +1,141 @@
+{
+  "dataset_size": 1,
+  "batch_size": 1,
+  "sample_id": [
+    "000000"
+  ],
+  "action_label": [
+    0
+  ],
+  "action_name": [],
+  "action_to_id": {
+    "shear": 0
+  },
+  "num_frames_per_sample": [
+    64
+  ],
+  "tensor_stats": {
+    "rgb": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.8352941274642944,
+      "mean": 0.07433236390352249
+    },
+    "stress": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.929411768913269,
+      "mean": 0.060559142380952835
+    },
+    "flow": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.03275138512253761
+    },
+    "force_mask": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.06658120453357697
+    },
+    "object_mask": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.13790413737297058
+    },
+    "params": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 6215.53271484375,
+      "mean": 1806.9769287109375
+    }
+  },
+  "params_dict": [
+    {
+      "E": 6215.532795807925,
+      "nu": 0.401352966564233,
+      "density": 1011.9736549801657,
+      "yield_stress": 0.0,
+      "action": "shear",
+      "object": "a_sponge_porous_soft_material_isolated_013020",
+      "sample_id": "000000"
+    }
+  ],
+  "params_tensor": [
+    [
+      6215.53271484375,
+      0.40135297179222107,
+      1011.9736328125,
+      0.0
+    ]
+  ],
+  "preview_dir": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/logic_model/loader_preview",
+  "preview_files": [
+    "logic_model/loader_preview/rgb_view00_frame000.png",
+    "logic_model/loader_preview/rgb_view00_frame001.png",
+    "logic_model/loader_preview/rgb_view01_frame000.png",
+    "logic_model/loader_preview/rgb_view01_frame001.png",
+    "logic_model/loader_preview/stress_view00_frame000.png",
+    "logic_model/loader_preview/stress_view00_frame001.png",
+    "logic_model/loader_preview/stress_view01_frame000.png",
+    "logic_model/loader_preview/stress_view01_frame001.png",
+    "logic_model/loader_preview/flow_view00_frame000.png",
+    "logic_model/loader_preview/flow_view00_frame001.png",
+    "logic_model/loader_preview/flow_view01_frame000.png",
+    "logic_model/loader_preview/flow_view01_frame001.png",
+    "logic_model/loader_preview/force_mask_view00_frame000.png",
+    "logic_model/loader_preview/force_mask_view00_frame001.png",
+    "logic_model/loader_preview/force_mask_view01_frame000.png",
+    "logic_model/loader_preview/force_mask_view01_frame001.png",
+    "logic_model/loader_preview/object_mask_view00_frame000.png",
+    "logic_model/loader_preview/object_mask_view00_frame001.png",
+    "logic_model/loader_preview/object_mask_view01_frame000.png",
+    "logic_model/loader_preview/object_mask_view01_frame001.png"
+  ]
+}

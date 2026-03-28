@@ -57,6 +57,7 @@ from my_utils.sim_utils import (
     build_bend_boundary_conditions,
     save_boundary_condition_info,
     save_external_force_info,
+    save_initial_force_mask_and_arrow_info,
     setup_field_output_dirs,
     save_fields_for_frame,
     write_stress_pcd_camera_meta_json,
@@ -80,6 +81,13 @@ from my_utils.filling_cache import (
     cache_dir_for_ply_model,
     save_filled_positions,
     try_load_filled_positions,
+)
+from my_utils.arch4_lmdb import write_sample_arch4_lmdb
+from my_utils.pack_tensors import (
+    compress_multiview_render_png_dirs,
+    compute_export_resolution,
+    downscale_multiview_render_png_dirs,
+    pack_sample_arch4_tensors,
 )
 
 def _select_best_gpu() -> None:
@@ -278,6 +286,90 @@ if __name__ == "__main__":
     parser.add_argument("--output_stress", action="store_true")
     parser.add_argument("--output_bc_info", action="store_true")
     parser.add_argument("--output_force_info", action="store_true")
+    parser.add_argument(
+        "--output_initial_force_mask_arrow",
+        action="store_true",
+        help="在 meta/ 额外导出初始受力区域 mask + 方向箭头（基于速度驱动 cuboid）。",
+    )
+    _cmp = parser.add_mutually_exclusive_group()
+    _cmp.add_argument(
+        "--compress_render_pngs",
+        action="store_true",
+        dest="compress_render_pngs",
+        help="渲染序列落盘后、打包 .pt / ffmpeg 前，对 RGB·stress·flow·force_mask 各视角 PNG 做 zlib 无损压缩（默认开启）。",
+    )
+    _cmp.add_argument(
+        "--no_compress_render_pngs",
+        action="store_false",
+        dest="compress_render_pngs",
+        help="关闭 PNG zlib 重写（磁盘占用更大、后续读写略快）。",
+    )
+    parser.set_defaults(compress_render_pngs=True)
+    parser.add_argument(
+        "--png_compression_level",
+        type=int,
+        default=6,
+        help="PNG zlib 级别 0-9（默认 6）；仅影响文件大小与编解码耗时，不改变像素。",
+    )
+    parser.add_argument(
+        "--render_export_max_side",
+        type=int,
+        default=0,
+        help=">0 时：将 images/stress_gaussian/flow_gaussian/force_mask 各视角 PNG 统一缩放到最长边≤该值"
+        "（保持宽高比，边长为偶数）。0 表示不按最长边限制。",
+    )
+    parser.add_argument(
+        "--render_export_scale",
+        type=float,
+        default=1.0,
+        help="(0,1) 时对上述导出 PNG 整体缩放；1.0 关闭。与 --render_export_max_side>0 同时配置时优先最长边。",
+    )
+    parser.add_argument(
+        "--camera_distance_scale",
+        type=float,
+        default=1.0,
+        help="相机距离缩放（>0）：实际渲染半径=init_radius/scale。scale 越大，镜头越近、物体占画面越大。",
+    )
+    parser.add_argument(
+        "--pack_arch4_tensors",
+        action="store_true",
+        help="将 images / stress_gaussian / flow_gaussian / force_mask 打成 arch4_tensors/<view>.pt（与 --pack_arch4_lmdb 二选一；默认与 lmdb 互斥见 runner）。",
+    )
+    parser.add_argument(
+        "--pack_arch4_lmdb",
+        action="store_true",
+        help="将四类 PNG 按 --arch4_lmdb_resize 缩放后写入 LMDB（uint8，单库多键）；不占 float32 .pt；在 ffmpeg 合成视频之前执行，PNG 仍保留供视频。",
+    )
+    parser.add_argument(
+        "--arch4_lmdb_resize",
+        type=int,
+        default=224,
+        help="写入 LMDB 前将每帧缩放到 正方形边长（像素），默认 224。",
+    )
+    parser.add_argument(
+        "--arch4_lmdb_map_size_gb",
+        type=float,
+        default=8.0,
+        help="LMDB map_size（GiB），须大于预估库体积；默认 8。",
+    )
+    parser.add_argument(
+        "--arch4_lmdb_name",
+        type=str,
+        default="arch4_data.lmdb",
+        help="样本目录下 LMDB 环境子目录名（相对 output_path），默认 arch4_data.lmdb。",
+    )
+    parser.add_argument(
+        "--pack_arch4_lmdb_include_object_mask",
+        action="store_true",
+        help="写入 LMDB 时额外写 object_mask 键（与 force_mask 分开存储）。",
+    )
+    parser.add_argument(
+        "--arch4_tensor_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="写入 arch4_tensors/*.pt 时的存储 dtype：float16/bfloat16 约减半磁盘；Dataset 读取时会转为 float32 再训练。",
+    )
     parser.add_argument("--field_output_interval", type=int, default=1)
     parser.add_argument(
         "--sim_type",
@@ -297,6 +389,23 @@ if __name__ == "__main__":
         type=int,
         default=-1,
         help="覆盖渲染视角数；-1 表示使用 --num_views。用于在配置里单独声明「渲染视角数量」。",
+    )
+    parser.add_argument(
+        "--random_render_views",
+        action="store_true",
+        help="启用随机视角：在 [0,360) 环绕范围随机挑选视角（带最小间隔约束）。",
+    )
+    parser.add_argument(
+        "--random_render_views_min_gap_deg",
+        type=float,
+        default=20.0,
+        help="随机视角最小方位角间隔（度）。",
+    )
+    parser.add_argument(
+        "--random_render_views_seed",
+        type=int,
+        default=0,
+        help="随机视角采样随机种子。",
     )
     parser.add_argument(
         "--num_render_timesteps",
@@ -364,6 +473,16 @@ if __name__ == "__main__":
         action="store_true",
         help="与主光栅同相机：第二遍 CUDA 3DGS，colors_precomp 为屏幕 (Δu,Δv) 的 Middlebury 伪彩，"
         "opacity 含原不透明度×幅值×距离权重；黑底输出 flow_gaussian/<view>/；不写 npz。",
+    )
+    parser.add_argument(
+        "--output_view_force_mask",
+        action="store_true",
+        help="每视角输出驱动区域 mask（黑底，仅 mask 渲染）。不影响 images 的 RGB 渲染。",
+    )
+    parser.add_argument(
+        "--output_view_object_mask",
+        action="store_true",
+        help="每视角输出物体 mask（白物体、黑背景）：通过 3DGS 光栅化，colors_precomp 固定白色。",
     )
     parser.add_argument(
         "--flow_gaussian_max_gaussians",
@@ -505,6 +624,8 @@ if __name__ == "__main__":
     _vprint = print if not bool(getattr(args, "quiet", False)) else (lambda *a, **k: None)
 
     want_flow_gaussian = bool(args.output_view_flow_gaussian)
+    want_force_mask = bool(args.output_view_force_mask)
+    want_object_mask = bool(args.output_view_object_mask)
     want_tracks_gaussian = bool(args.output_view_tracks_gaussian)
     want_subsampled_world_tracks = bool(args.output_subsampled_world_tracks)
     want_stress_heatmap = bool(args.output_view_stress_heatmap)
@@ -833,12 +954,58 @@ if __name__ == "__main__":
         mpm_solver.finalize_mu_lam()
 
         # 输出边界条件和力场信息（如果需要）
+        force_overlay_info = None
+        # 用于“velocity cuboid 前端截面触碰粒子”可视化（全程累计）
+        velocity_cuboids: List[Dict[str, Any]] = []
+        touched_mask_gs: Optional[torch.Tensor] = None
+        touched_first_frame_gs: Optional[torch.Tensor] = None
+
         if args.output_path is not None:
             meta_dir = os.path.join(args.output_path, "meta")
             if args.output_bc_info:
                 save_boundary_condition_info(bc_params, material_params, meta_dir)
             if args.output_force_info:
                 save_external_force_info(bc_params, material_params, meta_dir)
+            if args.output_initial_force_mask_arrow:
+                force_overlay_info = save_initial_force_mask_and_arrow_info(
+                    bc_params, mpm_init_pos, meta_dir
+                )
+                # 解析速度驱动 cuboid（压力杆）
+                for bc in (bc_params or []):
+                    bc_item = None
+                    if str(bc.get("type", "")).strip().lower() == "cuboid":
+                        bc_item = bc
+                    elif "set_velocity_on_cuboid" in bc:
+                        bc_item = bc["set_velocity_on_cuboid"]
+                    elif "enforce_particle_translation" in bc:
+                        bc_item = bc["enforce_particle_translation"]
+                    if bc_item is None:
+                        continue
+                    p = np.asarray(bc_item.get("point", [0.0, 0.0, 0.0]), dtype=np.float32)
+                    s = np.asarray(bc_item.get("size", [0.0, 0.0, 0.0]), dtype=np.float32)
+                    v = np.asarray(bc_item.get("velocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+                    v_norm = float(np.linalg.norm(v))
+                    if v_norm <= 1e-10:
+                        continue
+                    axis = int(np.argmax(np.abs(v)))
+                    sign = 1.0 if float(v[axis]) >= 0.0 else -1.0
+                    velocity_cuboids.append(
+                        {
+                            "point0": p,
+                            "size": s,
+                            "velocity": v,
+                            "axis": axis,
+                            "sign": sign,
+                            "start_time": float(bc_item.get("start_time", 0.0)),
+                            "end_time": float(bc_item.get("end_time", 1e9)),
+                        }
+                    )
+                if velocity_cuboids:
+                    touched_mask_gs = torch.zeros((int(gs_num),), device=device, dtype=torch.bool)
+                    touched_first_frame_gs = torch.full(
+                        (int(gs_num),), -1, device=device, dtype=torch.long
+                    )
+                _vprint(f"[force_debug] velocity_cuboids={len(velocity_cuboids)}")
         # camera setting
         mpm_space_viewpoint_center = (
             torch.tensor(camera_params["mpm_space_viewpoint_center"]).reshape((1, 3)).cuda()
@@ -890,7 +1057,6 @@ if __name__ == "__main__":
         fast_track_sim_frames: List[int] = []
         track_gaussian_accum_shared: Optional[TrajectoryGaussianAccumSharedState] = None
         flow_gaussian_shared: Optional[FlowGaussianSplatSharedState] = None
-
         save_vol = not bool(args.no_volumetric_stress_deformation)
         eff_output_deformation = bool(args.output_deformation) and save_vol
         eff_output_stress_vol = bool(args.output_stress) and save_vol
@@ -970,7 +1136,8 @@ if __name__ == "__main__":
                     num_views=nv_meta,
                     init_azimuthm=float(camera_params["init_azimuthm"]),
                     init_elevation=float(camera_params["init_elevation"]),
-                    init_radius=float(camera_params["init_radius"]),
+                    init_radius=float(camera_params["init_radius"])
+                    / max(1e-6, float(getattr(args, "camera_distance_scale", 1.0))),
                     model_path=model_path,
                     default_camera_index=int(
                         camera_params.get("default_camera_index", -1)
@@ -999,6 +1166,8 @@ if __name__ == "__main__":
                 or want_tracks_gaussian
                 or want_subsampled_world_tracks
                 or want_flow_gaussian
+                or want_force_mask
+                or want_object_mask
             ):
                 video_root = os.path.join(args.output_path, "videos")
                 os.makedirs(video_root, exist_ok=True)
@@ -1008,6 +1177,8 @@ if __name__ == "__main__":
             or bool(want_stress_heatmap)
             or bool(want_stress_gaussian)
             or bool(want_flow_gaussian)
+            or bool(want_force_mask)
+            or bool(want_object_mask)
             or bool(want_tracks_gaussian)
         )
 
@@ -1018,15 +1189,43 @@ if __name__ == "__main__":
         stress_gaussian_view_dirs: List[Optional[str]] = []
         tracks_gaussian_view_dirs: List[Optional[str]] = []
         flow_gaussian_view_dirs: List[Optional[str]] = []
+        force_mask_view_dirs: List[Optional[str]] = []
+        object_mask_view_dirs: List[Optional[str]] = []
         view_names: List[str] = []
         if need_view_pass and args.output_path is not None:
             nv_cfg = int(args.num_render_views)
             num_views_eff = max(1, nv_cfg if nv_cfg >= 0 else int(args.num_views))
             az_base = camera_params["init_azimuthm"]
             el_base = camera_params["init_elevation"]
-            for k in range(num_views_eff):
-                az = az_base + 360.0 * k / num_views_eff
-                az = az % 360.0
+            if bool(getattr(args, "random_render_views", False)):
+                rng = np.random.RandomState(int(getattr(args, "random_render_views_seed", 0)))
+                min_gap = max(0.0, float(getattr(args, "random_render_views_min_gap_deg", 20.0)))
+                picked: List[float] = []
+                tries = 0
+                max_tries = 5000
+                while len(picked) < num_views_eff and tries < max_tries:
+                    tries += 1
+                    cand = float(rng.uniform(0.0, 360.0))
+                    ok = True
+                    for a in picked:
+                        d = abs(cand - a)
+                        d = min(d, 360.0 - d)
+                        if d < min_gap:
+                            ok = False
+                            break
+                    if ok:
+                        picked.append(cand)
+                if len(picked) < num_views_eff:
+                    # 间隔约束过严时回退到均匀补齐，保证视角数稳定
+                    for k in range(num_views_eff):
+                        a = (az_base + 360.0 * k / num_views_eff) % 360.0
+                        picked.append(a)
+                    picked = picked[:num_views_eff]
+                az_list = sorted([a % 360.0 for a in picked])
+            else:
+                az_list = [((az_base + 360.0 * k / num_views_eff) % 360.0) for k in range(num_views_eff)]
+
+            for az in az_list:
                 el = el_base
                 views.append((az, el))
                 name = f"az{int(round(az))}_el{int(round(el))}"
@@ -1061,12 +1260,26 @@ if __name__ == "__main__":
                     flow_gaussian_view_dirs.append(fgd)
                 else:
                     flow_gaussian_view_dirs.append(None)
+                if want_force_mask:
+                    fmd = os.path.join(args.output_path, "force_mask", name)
+                    os.makedirs(fmd, exist_ok=True)
+                    force_mask_view_dirs.append(fmd)
+                else:
+                    force_mask_view_dirs.append(None)
+                if want_object_mask:
+                    omd = os.path.join(args.output_path, "object_mask", name)
+                    os.makedirs(omd, exist_ok=True)
+                    object_mask_view_dirs.append(omd)
+                else:
+                    object_mask_view_dirs.append(None)
         else:
             view_dirs = []
             stress_view_dirs = []
             stress_gaussian_view_dirs = []
             tracks_gaussian_view_dirs = []
             flow_gaussian_view_dirs = []
+            force_mask_view_dirs = []
+            object_mask_view_dirs = []
             view_names = []
 
         if (
@@ -1184,6 +1397,56 @@ if __name__ == "__main__":
                 else:
                     pos_world = pos_mpm_world
 
+                # 全仿真累计 touched mask：velocity cuboid 最前端截面触碰到的粒子
+                current_selected_idx: Optional[np.ndarray] = None
+                if (
+                    args.output_initial_force_mask_arrow
+                    and touched_mask_gs is not None
+                    and velocity_cuboids
+                ):
+                    t_sec = float((frame + 1) * frame_dt)
+                    pos_mpm = pos_base  # [gs_num,3]，与 BC 坐标系一致
+
+                    touched_now = torch.zeros_like(touched_mask_gs)
+                    active_any = False
+                    for rod in velocity_cuboids:
+                        st = float(rod["start_time"])
+                        et = float(rod["end_time"])
+                        # 超过 end_time 后不再更新受力区域
+                        if t_sec < st or t_sec > et:
+                            continue
+                        active_any = True
+                        dt_act = min(max(t_sec - st, 0.0), max(0.0, et - st))
+                        p_now = torch.tensor(
+                            rod["point0"] + rod["velocity"] * dt_act,
+                            device=pos_mpm.device,
+                            dtype=pos_mpm.dtype,
+                        )
+                        s = torch.tensor(rod["size"], device=pos_mpm.device, dtype=pos_mpm.dtype)
+
+                        # 杆体体积内（MPM 原生定义，和 solver 的 cuboid 条件一致）
+                        inside = (
+                            (torch.abs(pos_mpm[:, 0] - p_now[0]) < s[0])
+                            & (torch.abs(pos_mpm[:, 1] - p_now[1]) < s[1])
+                            & (torch.abs(pos_mpm[:, 2] - p_now[2]) < s[2])
+                        )
+                        # 直接以 cuboid 覆盖区域作为受力区域
+                        hit = inside
+                        touched_now = touched_now | hit
+
+                    touched_mask_gs = touched_mask_gs | touched_now
+                    if touched_first_frame_gs is not None:
+                        new_hit = touched_now & (touched_first_frame_gs < 0)
+                        if torch.any(new_hit):
+                            touched_first_frame_gs[new_hit] = int(frame)
+                    if int(frame) in render_frame_set:
+                        if active_any:
+                            # 仅在施力激活窗口内渲染 mask；释放后恢复原始 3DGS
+                            sel_t = torch.where(touched_now)[0]
+                            current_selected_idx = sel_t.detach().cpu().numpy().astype(np.int64)
+                        else:
+                            current_selected_idx = np.array([], dtype=np.int64)
+
                 if want_subsampled_world_tracks:
                     if fast_track_indices_np is None:
                         gsn = int(gs_num)
@@ -1258,7 +1521,8 @@ if __name__ == "__main__":
                             show_hint=camera_params["show_hint"],
                             init_azimuthm=az,
                             init_elevation=el,
-                            init_radius=camera_params["init_radius"],
+                            init_radius=float(camera_params["init_radius"])
+                            / max(1e-6, float(getattr(args, "camera_distance_scale", 1.0))),
                             move_camera=camera_params["move_camera"],
                             current_frame=frame,
                             delta_a=camera_params["delta_a"],
@@ -1272,6 +1536,26 @@ if __name__ == "__main__":
                         colors_precomp = convert_SH(
                             base_shs, current_camera, gaussians, pos_world, rot_base
                         )
+                        # 光栅 CUDA 前向不会把屏幕坐标写回 Python means2D（仍为全零）；
+                        # 热力图 / flow / force debug 等辅助输出必须用与 preprocess 一致的投影。
+                        means2d_for_aux = project_world_points_to_screen_means2d(
+                            pos_world,
+                            current_camera.full_proj_transform,
+                            int(width if width is not None else 1024),
+                            int(height if height is not None else 1024),
+                        )
+                        fc_idx: Optional[np.ndarray] = None
+                        if (
+                            args.output_initial_force_mask_arrow
+                            and current_selected_idx is not None
+                            and current_selected_idx.size > 0
+                        ):
+                            _tmp_idx = current_selected_idx[
+                                (current_selected_idx >= 0)
+                                & (current_selected_idx < int(colors_precomp.shape[0]))
+                            ]
+                            if _tmp_idx.size > 0:
+                                fc_idx = _tmp_idx
                         rendering, raddi = rasterize(
                             means3D=pos_world,
                             means2D=means2d_input,
@@ -1288,8 +1572,7 @@ if __name__ == "__main__":
                             height = _tmp.shape[0] // 2 * 2
                             width = _tmp.shape[1] // 2 * 2
 
-                        # 光栅 CUDA 前向不会把屏幕坐标写回 Python means2D（仍为全零）；
-                        # 热力图 / flow 等辅助输出必须用与 preprocess 一致的投影。
+                        # 分辨率确定后重算一次投影（用于后续热图/flow）
                         means2d_for_aux = project_world_points_to_screen_means2d(
                             pos_world,
                             current_camera.full_proj_transform,
@@ -1303,6 +1586,84 @@ if __name__ == "__main__":
                             cv2.imwrite(
                                 os.path.join(view_dirs[v_idx], f"{out_idx:04d}.png"),
                                 255 * cv2_img,
+                            )
+
+                        # 独立 mask 渲染（黑底，仅受力区域）
+                        if (
+                            want_force_mask
+                            and v_idx < len(force_mask_view_dirs)
+                            and force_mask_view_dirs[v_idx] is not None
+                            and fc_idx is not None
+                            and width is not None
+                            and height is not None
+                        ):
+                            fc_t = torch.as_tensor(
+                                fc_idx, device=base_opacity.device, dtype=torch.long
+                            )
+
+                            # 独立 force_mask 渲染：保留完整 3DGS，其余区域正常，mask 区域替换为红色
+                            colors_mask = colors_precomp.clone()
+                            red_rgb = torch.tensor(
+                                [1.0, 0.0, 0.0],
+                                device=colors_precomp.device,
+                                dtype=colors_precomp.dtype,
+                            )
+                            colors_mask[fc_t] = red_rgb
+
+                            # 背景与主渲染一致（非黑底），仅颜色替换
+                            bg_mask = background
+                            rasterize_mask = initialize_resterize(
+                                current_camera, gaussians, pipeline, bg_mask
+                            )
+                            rendering_mask, _ = rasterize_mask(
+                                means3D=pos_world,
+                                means2D=means2d_input,
+                                shs=None,
+                                colors_precomp=colors_mask,
+                                opacities=base_opacity,
+                                scales=None,
+                                rotations=None,
+                                cov3D_precomp=cov3D_world,
+                            )
+                            mask_img = rendering_mask.permute(1, 2, 0).detach().cpu().numpy()
+                            mask_img = cv2.cvtColor(mask_img, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(
+                                os.path.join(force_mask_view_dirs[v_idx], f"{out_idx:04d}.png"),
+                                np.clip(255.0 * mask_img, 0, 255).astype(np.uint8),
+                            )
+
+                        # 物体 mask 渲染（白物体、黑背景）
+                        if (
+                            want_object_mask
+                            and v_idx < len(object_mask_view_dirs)
+                            and object_mask_view_dirs[v_idx] is not None
+                            and width is not None
+                            and height is not None
+                        ):
+                            colors_obj_mask = torch.ones_like(colors_precomp)
+                            bg_obj_mask = torch.zeros(
+                                (3,), dtype=torch.float32, device=colors_precomp.device
+                            )
+                            rasterize_obj_mask = initialize_resterize(
+                                current_camera, gaussians, pipeline, bg_obj_mask
+                            )
+                            rendering_obj_mask, _ = rasterize_obj_mask(
+                                means3D=pos_world,
+                                means2D=means2d_input,
+                                shs=None,
+                                colors_precomp=colors_obj_mask,
+                                opacities=base_opacity,
+                                scales=None,
+                                rotations=None,
+                                cov3D_precomp=cov3D_world,
+                            )
+                            obj_mask_img = (
+                                rendering_obj_mask.permute(1, 2, 0).detach().cpu().numpy()
+                            )
+                            obj_mask_img = cv2.cvtColor(obj_mask_img, cv2.COLOR_BGR2RGB)
+                            cv2.imwrite(
+                                os.path.join(object_mask_view_dirs[v_idx], f"{out_idx:04d}.png"),
+                                np.clip(255.0 * obj_mask_img, 0, 255).astype(np.uint8),
                             )
 
                         if want_stress_heatmap and stress_view_dirs[v_idx] is not None:
@@ -1514,6 +1875,35 @@ if __name__ == "__main__":
                 "num_render_outputs": int(len(render_frame_indices)),
                 "render_img": bool(args.render_img),
                 "compile_video": bool(args.compile_video),
+                "compress_render_pngs": bool(
+                    getattr(args, "compress_render_pngs", True)
+                ),
+                "png_compression_level": int(
+                    getattr(args, "png_compression_level", 6)
+                ),
+                "render_export_max_side": int(
+                    getattr(args, "render_export_max_side", 0) or 0
+                ),
+                "render_export_scale": float(
+                    getattr(args, "render_export_scale", 1.0) or 1.0
+                ),
+                "camera_distance_scale": float(
+                    getattr(args, "camera_distance_scale", 1.0) or 1.0
+                ),
+                "arch4_tensor_dtype": str(
+                    getattr(args, "arch4_tensor_dtype", "float32")
+                ),
+                "pack_arch4_lmdb": bool(getattr(args, "pack_arch4_lmdb", False)),
+                "arch4_lmdb_resize": int(getattr(args, "arch4_lmdb_resize", 224)),
+                "arch4_lmdb_map_size_gb": float(
+                    getattr(args, "arch4_lmdb_map_size_gb", 8.0)
+                ),
+                "arch4_lmdb_name": str(getattr(args, "arch4_lmdb_name", "arch4_data.lmdb")),
+                "pack_arch4_lmdb_include_object_mask": bool(
+                    getattr(args, "pack_arch4_lmdb_include_object_mask", False)
+                ),
+                "png_sequence_width": int(width) if width is not None else None,
+                "png_sequence_height": int(height) if height is not None else None,
                 "delete_png_sequences_after_compile_video": bool(
                     args.delete_png_sequences_after_compile_video
                 ),
@@ -1529,6 +1919,8 @@ if __name__ == "__main__":
                 "stress_gaussian_vm_pct_low": float(args.stress_gaussian_vm_pct_low),
                 "stress_gaussian_vm_pct_high": float(args.stress_gaussian_vm_pct_high),
                 "output_view_flow_gaussian": bool(want_flow_gaussian),
+                "output_view_force_mask": bool(want_force_mask),
+                "output_view_object_mask": bool(want_object_mask),
                 "flow_gaussian_max_gaussians": int(args.flow_gaussian_max_gaussians),
                 "flow_gaussian_seed": int(args.flow_gaussian_seed),
                 "flow_gaussian_depth_gamma": float(args.flow_gaussian_depth_gamma),
@@ -1599,6 +1991,129 @@ if __name__ == "__main__":
             )
             _vprint(f"[modified_simulation] 已写出下采样世界轨迹: {tw_dir}/tracks_world.npz")
 
+        # 不再输出额外 force overlay/debug 文件，仅保留原 3DGS 渲染结果（通过 SH 着色体现受力区域）
+
+        # 序列 PNG：先按需降分辨率，再 zlib 压缩（可选），再打包 arch4 .pt；与 ffmpeg 是否可用无关
+        if args.output_path is not None and views:
+            mask_dirs_extra_for_post = object_mask_view_dirs if want_object_mask else []
+            if width is not None and height is not None:
+                nw, nh = int(width), int(height)
+                tw, th = compute_export_resolution(
+                    nw,
+                    nh,
+                    max_side=int(getattr(args, "render_export_max_side", 0) or 0),
+                    scale=float(getattr(args, "render_export_scale", 1.0) or 1.0),
+                )
+                if (tw, th) != (nw, nh):
+                    try:
+                        n_ds = downscale_multiview_render_png_dirs(
+                            view_dirs,
+                            stress_gaussian_view_dirs,
+                            flow_gaussian_view_dirs,
+                            force_mask_view_dirs,
+                            target_w=tw,
+                            target_h=th,
+                        )
+                        if mask_dirs_extra_for_post:
+                            n_ds += downscale_multiview_render_png_dirs(
+                                [],
+                                [],
+                                [],
+                                mask_dirs_extra_for_post,
+                                target_w=tw,
+                                target_h=th,
+                            )
+                        width, height = tw, th
+                        _vprint(
+                            f"[modified_simulation] PNG 导出分辨率 {nw}x{nh} -> {tw}x{th}，重写 {n_ds} 个文件"
+                        )
+                    except Exception as e:
+                        print(f"[modified_simulation] PNG 降分辨率失败（保留原始尺寸）: {e}")
+                meta_rp = os.path.join(args.output_path, "meta", "run_parameters.json")
+                if os.path.isfile(meta_rp):
+                    try:
+                        with open(meta_rp, "r", encoding="utf-8") as f:
+                            rp = json.load(f)
+                        rp["png_sequence_width"] = int(width)
+                        rp["png_sequence_height"] = int(height)
+                        write_run_parameters_json(meta_rp, rp)
+                    except Exception as e:
+                        print(
+                            f"[modified_simulation] 更新 run_parameters 中 png_sequence 分辨率失败: {e}"
+                        )
+
+            if bool(getattr(args, "compress_render_pngs", True)):
+                try:
+                    n_cmp = compress_multiview_render_png_dirs(
+                        view_dirs,
+                        stress_gaussian_view_dirs,
+                        flow_gaussian_view_dirs,
+                        force_mask_view_dirs,
+                        compression=int(getattr(args, "png_compression_level", 6)),
+                    )
+                    if mask_dirs_extra_for_post:
+                        n_cmp += compress_multiview_render_png_dirs(
+                            [],
+                            [],
+                            [],
+                            mask_dirs_extra_for_post,
+                            compression=int(getattr(args, "png_compression_level", 6)),
+                        )
+                    _vprint(
+                        f"[modified_simulation] PNG zlib 压缩完成，重写 {n_cmp} 个文件 "
+                        f"(level={int(getattr(args, 'png_compression_level', 6))})"
+                    )
+                except Exception as e:
+                    print(f"[modified_simulation] PNG 压缩失败（保留原图）: {e}")
+            if bool(getattr(args, "pack_arch4_lmdb", False)):
+                try:
+                    lm_info = write_sample_arch4_lmdb(
+                        args.output_path,
+                        resize=int(getattr(args, "arch4_lmdb_resize", 224)),
+                        env_rel=str(getattr(args, "arch4_lmdb_name", "arch4_data.lmdb")),
+                        force_mask_subdir="force_mask",
+                        object_mask_subdir="object_mask",
+                        include_object_mask=bool(
+                            getattr(args, "pack_arch4_lmdb_include_object_mask", False)
+                        ),
+                        num_frames=(
+                            len(render_frame_indices) if render_frame_indices else None
+                        ),
+                        map_size_gb=float(getattr(args, "arch4_lmdb_map_size_gb", 8.0)),
+                        overwrite=True,
+                    )
+                    _vprint(
+                        f"[modified_simulation] 已写入 arch4 LMDB: "
+                        f"views={lm_info.get('written', 0)} "
+                        f"T={lm_info.get('num_frames', 0)} "
+                        f"size={lm_info.get('img_size', 0)} "
+                        f"path={lm_info.get('lmdb_path', '')}"
+                    )
+                except Exception as e:
+                    print(f"[modified_simulation] 写入 arch4 LMDB 失败: {e}")
+            if args.pack_arch4_tensors and not bool(
+                getattr(args, "pack_arch4_lmdb", False)
+            ):
+                try:
+                    pack_info = pack_sample_arch4_tensors(
+                        args.output_path,
+                        out_subdir="arch4_tensors",
+                        force_mask_subdir="force_mask",
+                        num_frames=(
+                            len(render_frame_indices) if render_frame_indices else None
+                        ),
+                        img_size=(int(width) if width is not None else None),
+                        overwrite=True,
+                        tensor_dtype=str(getattr(args, "arch4_tensor_dtype", "float32")),
+                    )
+                    _vprint(
+                        f"[modified_simulation] 已打包 arch4_tensors: "
+                        f"written={pack_info.get('written', 0)} "
+                        f"skipped={pack_info.get('skipped', 0)}"
+                    )
+                except Exception as e:
+                    print(f"[modified_simulation] 打包 arch4_tensors 失败: {e}")
+
         # 为每个视角分别合成视频，放在 videos 目录下
         if args.compile_video and video_root is not None:
             # 与上文一致：N 模式用 render_outputs_per_sim_second；否则按仿真 frame_dt
@@ -1610,6 +2125,8 @@ if __name__ == "__main__":
                     f"请先安装 ffmpeg，或关闭 --compile_video。期望输出目录: {video_root}"
                 )
             else:
+                rendered_png_dirs_for_optional_delete: List[str] = []
+
                 def _ffmpeg_png_dir_to_mp4(
                     in_dir: str, out_mp4: str, vw: int, vh: int
                 ) -> bool:
@@ -1638,17 +2155,7 @@ if __name__ == "__main__":
                             print(proc.stderr)
                         return False
                     _vprint(f"[modified_simulation] 已输出视频: {out_mp4}")
-                    if bool(getattr(args, "delete_png_sequences_after_compile_video", False)):
-                        try:
-                            shutil.rmtree(in_dir, ignore_errors=False)
-                            _vprint(
-                                f"[modified_simulation] 已删除 PNG 序列目录: {in_dir}"
-                            )
-                        except OSError as e:
-                            print(
-                                f"[modified_simulation] 删除 PNG 目录失败（保留文件）: "
-                                f"{in_dir} — {e}"
-                            )
+                    rendered_png_dirs_for_optional_delete.append(in_dir)
                     return True
 
                 if (
@@ -1715,6 +2222,43 @@ if __name__ == "__main__":
                                 video_root, f"{name}_flow_gaussian.mp4"
                             )
                             _ffmpeg_png_dir_to_mp4(fg_dir, out_path, vw, vh)
+
+                    if want_force_mask:
+                        for v_idx, (az, el) in enumerate(views):
+                            if v_idx >= len(force_mask_view_dirs):
+                                break
+                            fm_dir = force_mask_view_dirs[v_idx]
+                            if fm_dir is None:
+                                continue
+                            name = f"az{int(round(az))}_el{int(round(el))}"
+                            out_path = os.path.join(
+                                video_root, f"{name}_force_mask.mp4"
+                            )
+                            _ffmpeg_png_dir_to_mp4(fm_dir, out_path, vw, vh)
+
+                    if want_object_mask:
+                        for v_idx, (az, el) in enumerate(views):
+                            if v_idx >= len(object_mask_view_dirs):
+                                break
+                            om_dir = object_mask_view_dirs[v_idx]
+                            if om_dir is None:
+                                continue
+                            name = f"az{int(round(az))}_el{int(round(el))}"
+                            out_path = os.path.join(
+                                video_root, f"{name}_object_mask.mp4"
+                            )
+                            _ffmpeg_png_dir_to_mp4(om_dir, out_path, vw, vh)
+
+                if bool(getattr(args, "delete_png_sequences_after_compile_video", False)):
+                    for d in sorted(set(rendered_png_dirs_for_optional_delete)):
+                        try:
+                            shutil.rmtree(d, ignore_errors=False)
+                            _vprint(f"[modified_simulation] 已删除 PNG 序列目录: {d}")
+                        except OSError as e:
+                            print(
+                                f"[modified_simulation] 删除 PNG 目录失败（保留文件）: "
+                                f"{d} — {e}"
+                            )
                 elif views:
                     print(
                         "[modified_simulation] 跳过多视角光栅 PNG 的 ffmpeg："

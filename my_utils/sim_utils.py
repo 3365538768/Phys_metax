@@ -473,6 +473,24 @@ def save_external_force_info(bc_params, material_params, save_dir: str) -> None:
         bc_params = []
 
     for i, bc in enumerate(bc_params):
+        if str(bc.get("type", "")).strip().lower() == "cuboid":
+            v = np.array(bc.get("velocity", [0.0, 0.0, 0.0]), dtype=float)
+            mag = float(np.linalg.norm(v))
+            if mag > 1e-12:
+                direction = (v / mag).tolist()
+                info["velocity_driven_boundary_conditions"].append(
+                    {
+                        "index": i,
+                        "type": "cuboid",
+                        "point": bc.get("point", None),
+                        "size": bc.get("size", None),
+                        "velocity": v.tolist(),
+                        "magnitude": mag,
+                        "direction": direction,
+                        "start_time": bc.get("start_time", None),
+                        "end_time": bc.get("end_time", None),
+                    }
+                )
         if "set_velocity_on_cuboid" in bc:
             sv = bc["set_velocity_on_cuboid"]
             v = np.array(sv.get("velocity", [0.0, 0.0, 0.0]), dtype=float)
@@ -515,6 +533,195 @@ def save_external_force_info(bc_params, material_params, save_dir: str) -> None:
         os.path.join(save_dir, "external_actions.json"), "w", encoding="utf-8"
     ) as f:
         json.dump(info, f, indent=2, ensure_ascii=False)
+
+
+def save_initial_force_mask_and_arrow_info(
+    bc_params,
+    mpm_init_pos: torch.Tensor,
+    save_dir: str,
+    *,
+    contact_band_ratio: float = 0.05,
+) -> Dict:
+    """
+    导出“初始受力区域 mask + 方向箭头”标签（基于速度驱动 cuboid）。
+
+    输出：
+    - meta/initial_force_mask_arrow.json：可读摘要（每个施力 cuboid 的方向、接触点等）
+    - meta/initial_force_mask_arrow.npz：粒子级 mask（union + 每个 cuboid 的索引）
+
+    说明：
+    - 仅处理带 velocity 且速度模长 > 0 的 cuboid 边界（set_velocity_on_cuboid / enforce_particle_translation）
+    - “初始接触区域”通过几何近似求得：在 cuboid 速度主轴正前方（或负前方）、
+      同时落在 cuboid 其它两个轴 footprint 内，且距离接触面的点。
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    if bc_params is None:
+        bc_params = []
+
+    pos = mpm_init_pos.detach().cpu().numpy().astype(np.float64)
+    n = int(pos.shape[0])
+    if n <= 0:
+        payload = {
+            "num_particles": 0,
+            "num_force_cuboids": 0,
+            "force_cuboids": [],
+            "union_mask_count": 0,
+        }
+        with open(os.path.join(save_dir, "initial_force_mask_arrow.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        np.savez_compressed(
+            os.path.join(save_dir, "initial_force_mask_arrow.npz"),
+            union_indices=np.array([], dtype=np.int64),
+        )
+        return {
+            "union_indices": np.array([], dtype=np.int64),
+            "force_cuboids": [],
+            "num_particles": 0,
+        }
+
+    pos_min = pos.min(axis=0)
+    pos_max = pos.max(axis=0)
+    obj_extent = np.maximum(pos_max - pos_min, 1e-12)
+
+    force_items: List[Dict] = []
+    union_mask = np.zeros(n, dtype=bool)
+    first_contact_mask = np.zeros(n, dtype=bool)
+    per_item_indices: List[np.ndarray] = []
+
+    def _extract_cuboid_velocity_bc(bc: Dict) -> Optional[Tuple[str, Dict]]:
+        # 兼容当前自动 BC 生成格式：{"type":"cuboid","point":...,"size":...,"velocity":...}
+        if str(bc.get("type", "")).strip().lower() == "cuboid":
+            return ("cuboid", bc)
+        if "set_velocity_on_cuboid" in bc:
+            return ("set_velocity_on_cuboid", bc["set_velocity_on_cuboid"])
+        if "enforce_particle_translation" in bc:
+            return ("enforce_particle_translation", bc["enforce_particle_translation"])
+        return None
+
+    for bc_i, bc in enumerate(bc_params):
+        parsed = _extract_cuboid_velocity_bc(bc)
+        if parsed is None:
+            continue
+        bc_type, c = parsed
+        p = np.array(c.get("point", [0.0, 0.0, 0.0]), dtype=np.float64)
+        s = np.array(c.get("size", [0.0, 0.0, 0.0]), dtype=np.float64)
+        v = np.array(c.get("velocity", [0.0, 0.0, 0.0]), dtype=np.float64)
+        v_norm = float(np.linalg.norm(v))
+        if not np.isfinite(v_norm) or v_norm <= 1e-12:
+            continue
+
+        dir_vec = v / v_norm
+        axis = int(np.argmax(np.abs(dir_vec)))
+        sign = 1.0 if dir_vec[axis] >= 0.0 else -1.0
+        other_axes = [a for a in (0, 1, 2) if a != axis]
+
+        # footprint：只保留落在 cuboid 横向截面附近的粒子
+        in_footprint = np.ones(n, dtype=bool)
+        for a in other_axes:
+            tol = max(1e-8, 0.05 * obj_extent[a])
+            in_footprint &= np.abs(pos[:, a] - p[a]) <= (s[a] + tol)
+
+        # 接触面（沿速度方向的“前表面”）
+        if sign > 0:
+            face = p[axis] + s[axis]
+            dist = pos[:, axis] - face
+            ahead = dist >= 0.0
+        else:
+            face = p[axis] - s[axis]
+            dist = face - pos[:, axis]
+            ahead = dist >= 0.0
+
+        cand = in_footprint & ahead
+        if not np.any(cand):
+            # 退化：只看 footprint，取沿速度主轴最靠近前表面的点
+            cand = in_footprint.copy()
+
+        if np.any(cand):
+            d = np.abs(dist[cand])
+            band = max(1e-8, float(contact_band_ratio) * float(obj_extent[axis]))
+            choose = d <= band
+            cand_idx = np.where(cand)[0]
+            if np.any(choose):
+                sel_idx = cand_idx[choose]
+            else:
+                # 若 band 内为空，至少保留最邻近一小批点
+                k = min(256, cand_idx.shape[0])
+                ord_idx = np.argsort(d)[:k]
+                sel_idx = cand_idx[ord_idx]
+        else:
+            sel_idx = np.array([], dtype=np.int64)
+
+        # “第一批接触/最先被驱动”粒子：在候选集中取最小沿主轴距离的窄层
+        first_idx = np.array([], dtype=np.int64)
+        if np.any(cand):
+            cand_idx = np.where(cand)[0]
+            d = np.abs(dist[cand])
+            d_min = float(np.min(d))
+            first_band = max(1e-8, 0.01 * float(obj_extent[axis]))
+            choose_first = d <= (d_min + first_band)
+            if np.any(choose_first):
+                first_idx = cand_idx[choose_first]
+            else:
+                kf = min(128, cand_idx.shape[0])
+                first_idx = cand_idx[np.argsort(d)[:kf]]
+
+        if sel_idx.size > 0:
+            union_mask[sel_idx] = True
+            contact_center = pos[sel_idx].mean(axis=0).tolist()
+        else:
+            contact_center = [float(p[0]), float(p[1]), float(p[2])]
+        if first_idx.size > 0:
+            first_contact_mask[first_idx] = True
+
+        per_item_indices.append(sel_idx.astype(np.int64))
+        force_items.append(
+            {
+                "bc_index": int(bc_i),
+                "bc_type": bc_type,
+                "point": [float(x) for x in p.tolist()],
+                "size": [float(x) for x in s.tolist()],
+                "velocity": [float(x) for x in v.tolist()],
+                "arrow_direction": [float(x) for x in dir_vec.tolist()],
+                "arrow_magnitude": float(v_norm),
+                "contact_center_world": [float(x) for x in contact_center],
+                "mask_count": int(sel_idx.size),
+                "first_contact_count": int(first_idx.size),
+            }
+        )
+
+    union_indices = np.where(union_mask)[0].astype(np.int64)
+    first_contact_indices = np.where(first_contact_mask)[0].astype(np.int64)
+
+    payload = {
+        "num_particles": int(n),
+        "num_force_cuboids": int(len(force_items)),
+        "force_cuboids": force_items,
+        "union_mask_count": int(union_indices.size),
+        "first_contact_count": int(first_contact_indices.size),
+        "note": "mask 为初始时刻近似接触区域；arrow_direction 来自 cuboid velocity 归一化向量",
+    }
+    with open(
+        os.path.join(save_dir, "initial_force_mask_arrow.json"), "w", encoding="utf-8"
+    ) as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    npz_payload: Dict[str, np.ndarray] = {
+        "union_indices": union_indices,
+        "first_contact_indices": first_contact_indices,
+        "num_particles": np.array([n], dtype=np.int64),
+    }
+    for i, arr in enumerate(per_item_indices):
+        npz_payload[f"cuboid_{i:02d}_indices"] = arr.astype(np.int64)
+    np.savez_compressed(
+        os.path.join(save_dir, "initial_force_mask_arrow.npz"),
+        **npz_payload,
+    )
+    return {
+        "union_indices": union_indices,
+        "first_contact_indices": first_contact_indices,
+        "force_cuboids": force_items,
+        "num_particles": int(n),
+    }
 
 
 def setup_field_output_dirs(

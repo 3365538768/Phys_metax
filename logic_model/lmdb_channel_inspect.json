@@ -1,0 +1,333 @@
+{
+  "sample_dir": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/auto_output/dataset_deformation_stress_500_new/train/000000",
+  "sample_id": "000000",
+  "modalities": {
+    "rgb": {
+      "shape": [
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "channels": [
+        {
+          "channel": 0,
+          "min": 0.0,
+          "max": 0.8352941274642944,
+          "mean": 0.043768469244241714,
+          "std": 0.17558924853801727,
+          "nonzero_ratio": 0.06440361178651148
+        },
+        {
+          "channel": 1,
+          "min": 0.0,
+          "max": 0.7372549176216125,
+          "mean": 0.034613560885190964,
+          "std": 0.13956709206104279,
+          "nonzero_ratio": 0.0642182226894664
+        },
+        {
+          "channel": 2,
+          "min": 0.0,
+          "max": 0.501960813999176,
+          "mean": 0.015228363685309887,
+          "std": 0.06184536963701248,
+          "nonzero_ratio": 0.06369537561118198
+        }
+      ],
+      "pairwise_diff": {
+        "mean_abs_diff_01": 0.009154905565083027,
+        "mean_abs_diff_02": 0.028540117666125298,
+        "mean_abs_diff_12": 0.019385207444429398,
+        "max_abs_diff_01": 0.30980393290519714,
+        "max_abs_diff_02": 0.6000000238418579,
+        "max_abs_diff_12": 0.41960787773132324
+      },
+      "likely_repeated_3ch": false,
+      "per_view_head": [
+        {
+          "view_index": 0,
+          "channel_means": [
+            0.04056309908628464,
+            0.032601725310087204,
+            0.014487193897366524
+          ],
+          "channel_stds": [
+            0.17131711542606354,
+            0.13821148872375488,
+            0.06183118373155594
+          ],
+          "mean_abs_diff_01": 0.007961373776197433,
+          "mean_abs_diff_02": 0.026075905188918114,
+          "mean_abs_diff_12": 0.018114525824785233
+        },
+        {
+          "view_index": 1,
+          "channel_means": [
+            0.044180531054735184,
+            0.03497695550322533,
+            0.015453157015144825
+          ],
+          "channel_stds": [
+            0.17655639350414276,
+            0.1404188722372055,
+            0.0624207966029644
+          ],
+          "mean_abs_diff_01": 0.009203575551509857,
+          "mean_abs_diff_02": 0.028727374970912933,
+          "mean_abs_diff_12": 0.019523806869983673
+        }
+      ]
+    },
+    "stress": {
+      "shape": [
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "channels": [
+        {
+          "channel": 0,
+          "min": 0.0,
+          "max": 0.929411768913269,
+          "mean": 0.01989050768315792,
+          "std": 0.09007902443408966,
+          "nonzero_ratio": 0.06236121768043155
+        },
+        {
+          "channel": 1,
+          "min": 0.0,
+          "max": 0.8901960849761963,
+          "mean": 0.029882891103625298,
+          "std": 0.13280697166919708,
+          "nonzero_ratio": 0.0623587264495642
+        },
+        {
+          "channel": 2,
+          "min": 0.0,
+          "max": 0.7686274647712708,
+          "mean": 0.025791989639401436,
+          "std": 0.1142297312617302,
+          "nonzero_ratio": 0.06270718736713435
+        }
+      ],
+      "pairwise_diff": {
+        "mean_abs_diff_01": 0.013047837652266026,
+        "mean_abs_diff_02": 0.017071571201086044,
+        "mean_abs_diff_12": 0.015183201059699059,
+        "max_abs_diff_01": 0.6509803533554077,
+        "max_abs_diff_02": 0.843137264251709,
+        "max_abs_diff_12": 0.772549033164978
+      },
+      "likely_repeated_3ch": false,
+      "per_view_head": [
+        {
+          "view_index": 0,
+          "channel_means": [
+            0.01786309853196144,
+            0.02514810673892498,
+            0.023869484663009644
+          ],
+          "channel_stds": [
+            0.08482449501752853,
+            0.11886017769575119,
+            0.1105184406042099
+          ],
+          "mean_abs_diff_01": 0.009793185628950596,
+          "mean_abs_diff_02": 0.015115093439817429,
+          "mean_abs_diff_12": 0.013378082774579525
+        },
+        {
+          "view_index": 1,
+          "channel_means": [
+            0.019684478640556335,
+            0.02875821478664875,
+            0.026657594367861748
+          ],
+          "channel_stds": [
+            0.08935287594795227,
+            0.1282529979944229,
+            0.11735758185386658
+          ],
+          "mean_abs_diff_01": 0.012427304871380329,
+          "mean_abs_diff_02": 0.017655430361628532,
+          "mean_abs_diff_12": 0.014883970841765404
+        }
+      ]
+    },
+    "flow": {
+      "shape": [
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "channels": [
+        {
+          "channel": 0,
+          "min": 0.0,
+          "max": 0.9960784316062927,
+          "mean": 0.017634311690926552,
+          "std": 0.10255659371614456,
+          "nonzero_ratio": 0.04596974898357781
+        },
+        {
+          "channel": 1,
+          "min": 0.0,
+          "max": 0.9960784316062927,
+          "mean": 0.012201303616166115,
+          "std": 0.07630273699760437,
+          "nonzero_ratio": 0.04229248462080144
+        },
+        {
+          "channel": 2,
+          "min": 0.0,
+          "max": 0.9960784316062927,
+          "mean": 0.010708467103540897,
+          "std": 0.0682804062962532,
+          "nonzero_ratio": 0.040498383191167095
+        }
+      ],
+      "pairwise_diff": {
+        "mean_abs_diff_01": 0.017870424315333366,
+        "mean_abs_diff_02": 0.01971207745373249,
+        "mean_abs_diff_12": 0.016839532181620598,
+        "max_abs_diff_01": 0.9960784316062927,
+        "max_abs_diff_02": 0.9960784316062927,
+        "max_abs_diff_12": 0.9960784316062927
+      },
+      "likely_repeated_3ch": false,
+      "per_view_head": [
+        {
+          "view_index": 0,
+          "channel_means": [
+            0.012811207212507725,
+            0.011887499131262302,
+            0.009821096435189247
+          ],
+          "channel_stds": [
+            0.08102831989526749,
+            0.08132323622703552,
+            0.06746148318052292
+          ],
+          "mean_abs_diff_01": 0.01126327645033598,
+          "mean_abs_diff_02": 0.017192915081977844,
+          "mean_abs_diff_12": 0.017325522378087044
+        },
+        {
+          "view_index": 1,
+          "channel_means": [
+            0.01667296327650547,
+            0.012808548286557198,
+            0.010644770227372646
+          ],
+          "channel_stds": [
+            0.1016988605260849,
+            0.07240189611911774,
+            0.06978575140237808
+          ],
+          "mean_abs_diff_01": 0.017751723527908325,
+          "mean_abs_diff_02": 0.02094859443604946,
+          "mean_abs_diff_12": 0.0157387163490057
+        }
+      ]
+    },
+    "force_mask": {
+      "shape": [
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "channels": [
+        {
+          "channel": 0,
+          "min": 0.0,
+          "max": 0.9960784316062927,
+          "mean": 0.04691696539521217,
+          "std": 0.18935896456241608,
+          "nonzero_ratio": 0.06395166098666029
+        },
+        {
+          "channel": 1,
+          "min": 0.0,
+          "max": 0.7137255072593689,
+          "mean": 0.0252218134701252,
+          "std": 0.11832790076732635,
+          "nonzero_ratio": 0.052439164142219385
+        },
+        {
+          "channel": 2,
+          "min": 0.0,
+          "max": 0.364705890417099,
+          "mean": 0.010650034062564373,
+          "std": 0.05018487200140953,
+          "nonzero_ratio": 0.050700181195525086
+        }
+      ],
+      "pairwise_diff": {
+        "mean_abs_diff_01": 0.02169516123831272,
+        "mean_abs_diff_02": 0.03626691922545433,
+        "mean_abs_diff_12": 0.014571795240044594,
+        "max_abs_diff_01": 0.9960784316062927,
+        "max_abs_diff_02": 0.9960784316062927,
+        "max_abs_diff_12": 0.41960787773132324
+      },
+      "likely_repeated_3ch": false,
+      "per_view_head": [
+        {
+          "view_index": 0,
+          "channel_means": [
+            0.039164990186691284,
+            0.020263588055968285,
+            0.008596792817115784
+          ],
+          "channel_stds": [
+            0.1760168969631195,
+            0.10850944370031357,
+            0.04616035521030426
+          ],
+          "mean_abs_diff_01": 0.01890140026807785,
+          "mean_abs_diff_02": 0.03056819550693035,
+          "mean_abs_diff_12": 0.011666801758110523
+        },
+        {
+          "view_index": 1,
+          "channel_means": [
+            0.04682451859116554,
+            0.025217590853571892,
+            0.010733342729508877
+          ],
+          "channel_stds": [
+            0.1893768608570099,
+            0.11903871595859528,
+            0.05084598809480667
+          ],
+          "mean_abs_diff_01": 0.02160693146288395,
+          "mean_abs_diff_02": 0.0360911563038826,
+          "mean_abs_diff_12": 0.01448424719274044
+        }
+      ]
+    }
+  },
+  "preview_dir": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/logic_model/lmdb_channel_preview",
+  "preview_files": [
+    "logic_model/lmdb_channel_preview/rgb_view00_frame000_ch0.png",
+    "logic_model/lmdb_channel_preview/rgb_view00_frame000_ch1.png",
+    "logic_model/lmdb_channel_preview/rgb_view00_frame000_ch2.png",
+    "logic_model/lmdb_channel_preview/stress_view00_frame000_ch0.png",
+    "logic_model/lmdb_channel_preview/stress_view00_frame000_ch1.png",
+    "logic_model/lmdb_channel_preview/stress_view00_frame000_ch2.png",
+    "logic_model/lmdb_channel_preview/flow_view00_frame000_ch0.png",
+    "logic_model/lmdb_channel_preview/flow_view00_frame000_ch1.png",
+    "logic_model/lmdb_channel_preview/flow_view00_frame000_ch2.png",
+    "logic_model/lmdb_channel_preview/force_mask_view00_frame000_ch0.png",
+    "logic_model/lmdb_channel_preview/force_mask_view00_frame000_ch1.png",
+    "logic_model/lmdb_channel_preview/force_mask_view00_frame000_ch2.png"
+  ]
+}

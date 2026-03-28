@@ -1,0 +1,428 @@
+{
+  "meta": {
+    "split_root": "auto_output/dataset_deformation_stress_500_new/train",
+    "sample_index": 0,
+    "sample_id": [
+      "000000"
+    ],
+    "action_name": [
+      "shear"
+    ],
+    "action_label": [
+      3
+    ],
+    "action_to_id": {
+      "bend": 0,
+      "drop": 1,
+      "press": 2,
+      "shear": 3,
+      "stretch": 4
+    },
+    "device": "cuda",
+    "model_num_frames": 64
+  },
+  "input": {
+    "x": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.8352941274642944,
+      "mean": 0.03120347484946251,
+      "std": 0.13485848903656006,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "stress_gt": {
+      "shape": [
+        1,
+        3,
+        1,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.929411768913269,
+      "mean": 0.01989050768315792,
+      "std": 0.09007879346609116,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "flow_gt": {
+      "shape": [
+        1,
+        3,
+        1,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.01763431541621685,
+      "std": 0.10255678743124008,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "force_gt": {
+      "shape": [
+        1,
+        3,
+        1,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.046916984021663666,
+      "std": 0.1893591433763504,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "params_gt_raw": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 6215.53271484375,
+      "mean": 1806.9769287109375,
+      "std": 2578.578857421875,
+      "values_head": [
+        6215.53271484375,
+        0.40135297179222107,
+        1011.9736328125,
+        0.0
+      ]
+    },
+    "params_gt_train_space": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 8.734967231750488,
+      "mean": 4.0142412185668945,
+      "std": 3.869739532470703,
+      "values_head": [
+        8.734967231750488,
+        0.40135297179222107,
+        6.920645713806152,
+        0.0
+      ]
+    }
+  },
+  "bottleneck": {
+    "contact_latent": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.float32",
+      "min": -0.07418106496334076,
+      "max": 0.06787903606891632,
+      "mean": 0.0033104284666478634,
+      "std": 0.03227853775024414,
+      "values_head": [
+        -0.04774342477321625,
+        0.0017283391207456589,
+        0.016504455357789993,
+        0.021744586527347565,
+        0.01814045011997223,
+        -0.011137612164020538,
+        0.03935997188091278,
+        0.006601404398679733
+      ]
+    },
+    "deformation_latent": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.float32",
+      "min": -0.07641519606113434,
+      "max": 0.0680052787065506,
+      "mean": -0.005417701788246632,
+      "std": 0.03174186870455742,
+      "values_head": [
+        -0.06986193358898163,
+        0.012837039306759834,
+        0.0031316205859184265,
+        -0.009008053690195084,
+        -0.0139824403449893,
+        -0.02990742400288582,
+        -0.045517921447753906,
+        -0.0007131225429475307
+      ]
+    },
+    "stress_latent": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.float32",
+      "min": -0.07788912951946259,
+      "max": 0.06935984641313553,
+      "mean": 0.000558646279387176,
+      "std": 0.03504524007439613,
+      "values_head": [
+        -0.022057656198740005,
+        -0.053212836384773254,
+        -0.04946039989590645,
+        0.06849431991577148,
+        -0.024080481380224228,
+        -0.016973812133073807,
+        0.04731052741408348,
+        0.018288327381014824
+      ]
+    }
+  },
+  "predictions": {
+    "param_pred": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.2594330608844757,
+      "max": 0.7261168360710144,
+      "mean": 0.5904547572135925,
+      "std": 0.1917821317911148,
+      "values_head": [
+        0.7261168360710144,
+        0.2594330608844757,
+        0.6826900243759155,
+        0.6935791373252869
+      ]
+    },
+    "param_pred_raw": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.2594330608844757,
+      "max": 1.0670382976531982,
+      "mean": 0.8266324996948242,
+      "std": 0.3290676176548004,
+      "values_head": [
+        1.0670382976531982,
+        0.2594330608844757,
+        0.9791946411132812,
+        1.0008641481399536
+      ]
+    },
+    "action_logits": {
+      "shape": [
+        1,
+        5
+      ],
+      "dtype": "torch.float32",
+      "min": -0.043776318430900574,
+      "max": 0.058505646884441376,
+      "mean": -0.011728296056389809,
+      "std": 0.03680067136883736,
+      "values_head": [
+        -0.010265149176120758,
+        0.058505646884441376,
+        -0.034973278641700745,
+        -0.028132379055023193,
+        -0.043776318430900574
+      ]
+    },
+    "action_prob": [
+      [
+        0.20015528798103333,
+        0.21440447866916656,
+        0.19527041912078857,
+        0.19661083817481995,
+        0.19355900585651398
+      ]
+    ],
+    "action_pred": [
+      1
+    ],
+    "stress_field_pred": {
+      "shape": [
+        1,
+        3,
+        1,
+        64,
+        112,
+        112
+      ],
+      "dtype": "torch.float32",
+      "min": -0.8934654593467712,
+      "max": 0.9413360357284546,
+      "mean": 0.00017464450502302498,
+      "std": 0.18709130585193634,
+      "values_head": [
+        -0.4030585289001465,
+        0.1534145474433899,
+        0.062420349568128586,
+        -0.09791397303342819,
+        0.1456386148929596,
+        -0.11299499124288559,
+        -0.06623055785894394,
+        0.057588912546634674
+      ]
+    },
+    "flow_field_pred": {
+      "shape": [
+        1,
+        3,
+        1,
+        64,
+        112,
+        112
+      ],
+      "dtype": "torch.float32",
+      "min": -0.9239763021469116,
+      "max": 1.051327109336853,
+      "mean": 0.000429792475188151,
+      "std": 0.2045874297618866,
+      "values_head": [
+        0.2250678539276123,
+        0.006125515326857567,
+        0.12187273800373077,
+        -0.028198398649692535,
+        -0.22092929482460022,
+        -0.06995195150375366,
+        -0.3513866066932678,
+        -0.14027728140354156
+      ]
+    },
+    "force_pred": {
+      "shape": [
+        1,
+        3,
+        1,
+        64,
+        112,
+        112
+      ],
+      "dtype": "torch.float32",
+      "min": -0.8962900638580322,
+      "max": 0.9626772403717041,
+      "mean": -0.00010661596752470359,
+      "std": 0.20059895515441895,
+      "values_head": [
+        0.10373091697692871,
+        0.31457316875457764,
+        0.06235126778483391,
+        0.040818654000759125,
+        0.1755501627922058,
+        -0.26834753155708313,
+        0.18404608964920044,
+        0.21276924014091492
+      ]
+    },
+    "logvar": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "std": 0.0,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "loss": {
+    "loss_total": 6.28966760635376,
+    "loss_reg": 4.41895866394043,
+    "loss_stress": 0.04338382929563522,
+    "loss_flow": 0.052452798932790756,
+    "loss_force": 0.0777360051870346,
+    "loss_action": 1.6265289783477783,
+    "action_acc": 0.0,
+    "loss_phys_total": 2.1814401149749756,
+    "loss_stress_flow_consistency": 0.7445356249809265,
+    "loss_force_stress_consistency": 0.7181405425071716,
+    "loss_force_flow_consistency": 0.7187640070915222
+  },
+  "grad_norm": {
+    "global_before_clip": 1.0906840562820435,
+    "encoder": 0.2905540235864358,
+    "fusion": 0.1451574410262568,
+    "physics_bottleneck": 0.17579229977435215,
+    "param_head": 0.2347894956610491,
+    "action_head": 0.8979786177817016,
+    "stress_head": 0.024811593326740947,
+    "flow_head": 0.027967919331557275,
+    "force_head": 0.02655707330446573
+  },
+  "preview": {
+    "dir": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/logic_model/train_step_preview",
+    "files": [
+      "logic_model/train_step_preview/rgb_view00_frame000.png",
+      "logic_model/train_step_preview/rgb_view00_frame001.png",
+      "logic_model/train_step_preview/rgb_view01_frame000.png",
+      "logic_model/train_step_preview/rgb_view01_frame001.png",
+      "logic_model/train_step_preview/stress_gt_view00_frame000.png",
+      "logic_model/train_step_preview/stress_gt_view00_frame001.png",
+      "logic_model/train_step_preview/stress_gt_view01_frame000.png",
+      "logic_model/train_step_preview/stress_gt_view01_frame001.png",
+      "logic_model/train_step_preview/flow_gt_view00_frame000.png",
+      "logic_model/train_step_preview/flow_gt_view00_frame001.png",
+      "logic_model/train_step_preview/flow_gt_view01_frame000.png",
+      "logic_model/train_step_preview/flow_gt_view01_frame001.png",
+      "logic_model/train_step_preview/force_gt_view00_frame000.png",
+      "logic_model/train_step_preview/force_gt_view00_frame001.png",
+      "logic_model/train_step_preview/force_gt_view01_frame000.png",
+      "logic_model/train_step_preview/force_gt_view01_frame001.png"
+    ]
+  }
+}

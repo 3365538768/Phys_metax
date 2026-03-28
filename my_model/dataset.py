@@ -1,520 +1,583 @@
+# -*- coding: utf-8 -*-
 """
-PhysGaussian 数据集：从 auto_output 读取时序图像 + 物理参数。
+扁平集 ``auto_output/<dataset>/{train,test}/<id>/``（skills/数据集构建）。
 
-数据结构（以实际目录为准）：
-auto_output/<action>/<OBJECT__PARAMS__action>/<obj>/images/<camera_name>/*.png
-或（仿真 runner 默认 output_layout=by_model）：
-auto_output/<OBJECT>/<OBJECT__PARAMS__action>/<obj>/images/...
-或（runner 新布局）：auto_output/<OBJECT>/<NNNN>/images/...，参数见 gt_parameters.json
-
-扁平数据集（transform_dataset 生成）：
-auto_output/<dataset_dir>/{train,test}/<编号>/images/*.png + gt.json（默认 dataset_dir=dataset_400）
+- 单一真值：``gt.json``。
+- 张量布局：Dataset 输出 ``x [V, 1, T, H, W]``（仅 images 时序单通道），以及 stress/flow/force_mask 真值各 ``[V, 1, T, H, W]``。
 """
+
+from __future__ import annotations
+
 import json
-import os
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-
-ACTION_NAMES = ("bend", "drop", "press", "shear", "stretch")
-MATERIAL_CATEGORIES = ("jelly", "metal", "plasticine")
-NUM_FEATURES = ["E", "nu", "density", "yield_stress"]
+from my_utils.arch4_lmdb import lmdb_arch4_is_valid, read_arch4_lmdb_view_tensors
 
 
 def resolve_flat_dataset_root(dataset_dir: str, auto_output: Path) -> Path:
-    """
-    扁平数据集根目录（其下应有 train/、test/）。
-
-    - **推荐**：相对 ``auto_output`` 的一级名，如 ``dataset_400`` → ``<phys_root>/auto_output/dataset_400``。
-    - **兼容误写**：若写成 ``auto_output/dataset_400``，则按 **PhysGaussian 根** 解析，不再与 ``auto_output`` 拼两次
-      （否则会错误得到 ``auto_output/auto_output/dataset_400``）。
-    - **绝对路径**：直接使用。
-    """
     p = Path(dataset_dir).expanduser()
     if p.is_absolute():
         return p.resolve()
-    ap = Path(auto_output).resolve()
     parts = p.parts
     if parts and parts[0] == "auto_output":
-        return ap.parent.joinpath(*parts).resolve()
-    return (ap / p).resolve()
-
-
-def parse_params_to_dict(params_str: str) -> Dict[str, str]:
-    """解析 E=1.62e+04_density=1.28e+03_... 为 {key: value}"""
-    if not params_str.strip():
-        return {}
-    tokens = params_str.split("_")
-    result: Dict[str, str] = {}
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if "=" in t:
-            k, _, v = t.partition("=")
-            result[k] = v
-            i += 1
-        else:
-            if i + 1 < len(tokens):
-                nxt = tokens[i + 1]
-                if "=" not in nxt:
-                    result[t] = nxt
-                    i += 2
-                else:
-                    k2, _, v2 = nxt.partition("=")
-                    result[f"{t}_{k2}"] = v2
-                    i += 2
-            else:
-                i += 1
-    return result
-
-
-def _material_params_to_str_dict(mp) -> Dict[str, str]:
-    if not isinstance(mp, dict):
-        return {}
-    return {str(k): str(v) for k, v in mp.items()}
-
-
-def iter_auto_output_runs(auto_output_root: Path):
-    """
-    遍历 auto_output，返回 (action, run_dir, params_dict)。
-    run_dir 为仿真样本根目录（其下含 images/；旧布局时可能为中间层目录且内含 <obj>/）。
-    支持：auto_output/<action>/... 与 auto_output/<model>/...，以及数字目录 + gt_parameters.json。
-    """
-    seen: set[str] = set()
-
-    def emit(act: str, run_dir: Path, params: Dict[str, str]):
-        k = str(run_dir.resolve())
-        if k in seen:
-            return
-        seen.add(k)
-        return (act, run_dir, params)
-
-    for action in ACTION_NAMES:
-        action_dir = auto_output_root / action
-        if not action_dir.is_dir():
-            continue
-        for run_dir in action_dir.iterdir():
-            if not run_dir.is_dir():
-                continue
-            name = run_dir.name
-            if "__" not in name or len(name.split("__")) < 3:
-                continue
-            segs = name.split("__")
-            params_str = "__".join(segs[1:-1])
-            params = parse_params_to_dict(params_str)
-            out = emit(action, run_dir, params)
-            if out is not None:
-                yield out
-        # auto_output/<action>/<model>/<NNNN>/
-        for model_sub in sorted(action_dir.iterdir(), key=lambda p: p.name):
-            if not model_sub.is_dir():
-                continue
-            if model_sub.name in ACTION_NAMES:
-                continue
-            for run_dir in sorted(model_sub.iterdir(), key=lambda p: p.name):
-                if not run_dir.is_dir() or not run_dir.name.isdigit():
-                    continue
-                gt_path = run_dir / "gt_parameters.json"
-                if not gt_path.is_file():
-                    continue
-                try:
-                    with open(gt_path, "r", encoding="utf-8") as f:
-                        gt = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                action_from = str(gt.get("sim_type", ""))
-                if action_from != action:
-                    continue
-                params = _material_params_to_str_dict(gt.get("material_params"))
-                out = emit(action_from, run_dir, params)
-                if out is not None:
-                    yield out
-
-    skip_top = set(ACTION_NAMES) | {"_tmp_configs", "stats", "combined"}
-    for model_top in sorted(auto_output_root.iterdir()):
-        if not model_top.is_dir() or model_top.name in skip_top:
-            continue
-        for run_dir in sorted(model_top.iterdir(), key=lambda p: p.name):
-            if not run_dir.is_dir():
-                continue
-            name = run_dir.name
-            # 新：样本根即 <model>/<NNNN>/
-            if name.isdigit() and (run_dir / "gt_parameters.json").is_file():
-                try:
-                    with open(run_dir / "gt_parameters.json", "r", encoding="utf-8") as f:
-                        gt = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                action_from = str(gt.get("sim_type", ""))
-                if action_from not in ACTION_NAMES:
-                    continue
-                params = _material_params_to_str_dict(gt.get("material_params"))
-                out = emit(action_from, run_dir, params)
-                if out is not None:
-                    yield out
-                continue
-            if "__" not in name or len(name.split("__")) < 3:
-                continue
-            segs = name.split("__")
-            action_from = segs[-1]
-            if action_from not in ACTION_NAMES:
-                continue
-            params_str = "__".join(segs[1:-1])
-            params = parse_params_to_dict(params_str)
-            out = emit(action_from, run_dir, params)
-            if out is not None:
-                yield out
-
-
-def find_video_in_run_dir(run_dir: Path) -> Optional[Path]:
-    """在仿真目录下查找视频文件"""
-    exts = (".mp4", ".avi", ".mov", ".mkv", ".webm")
-    for root, _, files in os.walk(run_dir):
-        for fname in sorted(files):
-            if any(fname.lower().endswith(ext) for ext in exts):
-                return Path(root) / fname
-    return None
-
-
-def _sorted_image_files(image_dir: Path) -> List[Path]:
-    exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-    files = [p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
-    files.sort(key=lambda p: p.name)
-    return files
-
-
-def find_images_dir(run_dir: Path) -> Optional[Path]:
-    """
-    在单个仿真目录下查找 images 目录（通常在 <obj>/images 下）。
-    返回包含帧图片的目录（可能还有一层相机目录）。
-    """
-    # 常见结构：run_dir/<obj>/images/<camera>/*.png
-    for root, dirs, _files in os.walk(run_dir):
-        if "images" in dirs:
-            images_root = Path(root) / "images"
-            # 若 images_root 下还有一层子目录（相机名），优先选第一个有图的
-            subdirs = [d for d in images_root.iterdir() if d.is_dir()]
-            if subdirs:
-                for sd in sorted(subdirs, key=lambda p: p.name):
-                    if _sorted_image_files(sd):
-                        return sd
-            if _sorted_image_files(images_root):
-                return images_root
-    return None
-
-
-def is_image_sequence_readable(image_dir: Path) -> bool:
-    files = _sorted_image_files(image_dir)
-    if not files:
-        return False
-    img = cv2.imread(str(files[0]), cv2.IMREAD_COLOR)
-    return img is not None
-
-
-def extract_frames_from_images(image_dir: Path, num_frames: int = 16) -> np.ndarray:
-    """
-    从 images 目录中读取时序帧，返回 (T, H, W, 3) 的 numpy 数组。
-    **长度恒为 num_frames**：在 [0, N-1] 上均匀取 num_frames 个索引（N 少则同一帧会重复出现）。
-    这样 DataLoader 才能稳定 stack；若用「不足 num_frames 就全读」，batch 内 T 不一致会触发 collate 报错。
-    """
-    files = _sorted_image_files(image_dir)
-    if not files:
-        raise ValueError(f"images 目录无图片: {image_dir}")
-
-    n = len(files)
-    # 与「帧数 > num_frames 时 subsample」同一规则；n<=num_frames 时也保持输出 T=num_frames
-    idxs = np.linspace(0, n - 1, num_frames).astype(int).tolist()
-
-    frames = []
-    for i in idxs:
-        img = cv2.imread(str(files[i]), cv2.IMREAD_COLOR)
-        if img is None:
-            continue
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        frames.append(img)
-    if not frames:
-        raise ValueError(f"图片读取失败: {image_dir}")
-    return np.stack(frames, axis=0)
-
-
-def safe_float(params: Dict[str, str], key: str) -> float:
-    v = params.get(key, "")
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def material_to_idx(material: str) -> int:
-    m = str(material).lower()
-    if m in MATERIAL_CATEGORIES:
-        return MATERIAL_CATEGORIES.index(m)
-    if "jelly" in m:
-        return 0
-    if "metal" in m:
-        return 1
-    return 2  # plasticine
-
-
-def action_to_idx(action: str) -> int:
-    a = str(action).lower()
-    if a in ACTION_NAMES:
-        return ACTION_NAMES.index(a)
-    return 0
-
-
-class PhysGaussianDataset(Dataset):
-    """
-    时序图像 + 物理参数数据集。
-    每个样本：frames (T, H, W, 3), params (E, nu, density, yield_stress), material_idx, action_idx
-    """
-
-    def __init__(
-        self,
-        auto_output_root: Path,
-        num_frames: int = 16,
-        img_size: int = 224,
-        sample_ids: Optional[List[Tuple[str, Path, Dict[str, str]]]] = None,
-    ):
-        self.auto_output_root = Path(auto_output_root)
-        self.num_frames = num_frames
-        self.img_size = img_size
-
-        if sample_ids is None:
-            self.samples = [
-                (action, run_dir, params)
-                for action, run_dir, params in iter_auto_output_runs(self.auto_output_root)
-            ]
-        else:
-            self.samples = sample_ids
-
-        # 过滤出有可读 images 的样本
-        self.valid_samples: List[Tuple[str, Path, Dict[str, str], Path]] = []
-        for action, run_dir, params in self.samples:
-            image_dir = find_images_dir(run_dir)
-            if image_dir is None:
-                continue
-            if is_image_sequence_readable(image_dir):
-                self.valid_samples.append((action, run_dir, params, image_dir))
-
-    def __len__(self) -> int:
-        return len(self.valid_samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 如果遇到极少数运行时不可读图片，尝试跳过到下一个样本
-        for _ in range(3):
-            action, run_dir, params, image_dir = self.valid_samples[idx]
-            try:
-                frames = extract_frames_from_images(image_dir, self.num_frames)
-                break
-            except Exception:
-                idx = (idx + 1) % len(self.valid_samples)
-        else:
-            # 连续失败，抛出异常以便用户发现数据问题
-            raise ValueError(f"连续多个样本图片无法读取，最后一个路径: {image_dir}")
-        #  resize 并归一化到 [0,1]
-        frames_resized = []
-        for f in frames:
-            f = cv2.resize(f, (self.img_size, self.img_size))
-            frames_resized.append(f)
-        frames = np.stack(frames_resized, axis=0).astype(np.float32) / 255.0
-        # (T, H, W, C) -> (T, C, H, W)；transpose 后为非连续数组，勿用 torch.from_numpy 直接进多进程 DataLoader
-        frames = np.ascontiguousarray(np.transpose(frames, (0, 3, 1, 2)))
-
-        E = safe_float(params, "E")
-        nu = safe_float(params, "nu")
-        density = safe_float(params, "density")
-        yield_stress = safe_float(params, "yield_stress")
-        params_tensor = torch.tensor([E, nu, density, yield_stress], dtype=torch.float32)
-
-        material_idx = material_to_idx(params.get("material", "plasticine"))
-        action_idx = action_to_idx(action)
-
-        # torch.tensor 拷贝一份，避免与 numpy 共享不可 resize 的 storage（DDP/多 worker collate 会报错）
-        frames_t = torch.tensor(frames, dtype=torch.float32)
-        return (
-            frames_t,
-            params_tensor,
-            torch.tensor(material_idx, dtype=torch.long),
-            torch.tensor(action_idx, dtype=torch.long),
-        )
+        return (auto_output.parent.joinpath(*parts)).resolve()
+    return (auto_output / p).resolve()
 
 
 def list_dataset400_sample_dirs(split_root: Path) -> List[Path]:
-    """dataset_400 下按数字排序的样本目录列表。"""
-    split_root = Path(split_root)
-    if not split_root.is_dir():
+    root = Path(split_root)
+    if not root.is_dir():
         return []
-    dirs = [p for p in split_root.iterdir() if p.is_dir() and p.name.isdigit()]
-    dirs.sort(key=lambda p: int(p.name))
-    return dirs
+    numeric = re.compile(r"^\d+$")
+    return sorted([d for d in root.iterdir() if d.is_dir() and numeric.match(d.name)], key=lambda x: int(x.name))
 
 
-def _regression_float(reg: Dict, key: str, default: float = 0.0) -> float:
-    """gt.json 中 jelly 等材质 yield_stress 常为 null；reg.get(k, d) 在键存在且值为 null 时仍会得到 None。"""
-    v = reg.get(key, default)
+def _coerce_float(v: Any, default: float = 0.0) -> float:
     if v is None:
-        return default
+        return float(default)
     try:
         return float(v)
     except (TypeError, ValueError):
-        return default
+        return float(default)
 
 
-def _load_gt_from_dir(sample_dir: Path) -> Tuple[str, Dict[str, str], Dict[str, float]]:
+def _normalize_regression(reg: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, float]:
+    """``gt.json`` 里 ``regression`` 可能含 ``null``（如非金属无 ``yield_stress``），统一为 float。"""
+    keys = ("E", "nu", "density", "yield_stress")
+    out: Dict[str, float] = {}
+    for k in keys:
+        v = reg.get(k) if isinstance(reg, dict) else None
+        if v is None and isinstance(params, dict):
+            v = params.get(k)
+        out[k] = _coerce_float(v, 0.0)
+    return out
+
+
+def _load_gt_from_dir(sample_dir: Path) -> Tuple[str, dict, dict]:
     with open(sample_dir / "gt.json", "r", encoding="utf-8") as f:
         gt = json.load(f)
-    action = str(gt.get("action", "bend"))
-    params = {str(k): str(v) for k, v in gt.get("params", {}).items()}
-    reg = gt.get("regression", {})
-    regression = {
-        "E": _regression_float(reg, "E", 0.0),
-        "nu": _regression_float(reg, "nu", 0.0),
-        "density": _regression_float(reg, "density", 0.0),
-        "yield_stress": _regression_float(reg, "yield_stress", 0.0),
-    }
-    return action, params, regression
+    action = str(gt.get("action", ""))
+    params = gt.get("parameters") or {}
+    reg = gt.get("regression") or {}
+    if not reg and params:
+        reg = {
+            "E": params.get("E", 0),
+            "nu": params.get("nu", 0),
+            "density": params.get("density", 0),
+            "yield_stress": params.get("yield_stress", 0),
+        }
+    reg = _normalize_regression(reg, params if isinstance(params, dict) else {})
+    return action, params, reg
 
 
-def _images_dir_has_any_frame(img_dir: Path) -> bool:
-    """仅检查 images 下是否存在常见图片扩展名文件，不读像素（用于快速启动）。"""
-    exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-    for p in img_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in exts:
-            return True
-    return False
+def list_multiview_camera_dirs(root: Path) -> List[str]:
+    if not root.is_dir():
+        return []
+    return sorted([d.name for d in root.iterdir() if d.is_dir()])
 
 
-def dataset400_sample_fully_readable(sample_dir: Path, num_frames: int, img_size: int) -> bool:
-    """
-    与 __getitem__ 一致地尝试加载：gt.json + 均匀采样帧 + 每帧 resize。
-    用于构建数据集时剔除坏样本，避免 DataLoader worker 里崩或错误地用「下一个样本」顶替当前 idx。
-    """
+def _sorted_image_files(d: Path) -> List[Path]:
+    if not d.is_dir():
+        return []
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+    fs = [x for x in d.iterdir() if x.is_file() and x.suffix.lower() in exts]
+    return sorted(fs, key=lambda p: p.name)
+
+
+def extract_frames_from_images(view_dir: Path, num_frames: int) -> List[np.ndarray]:
+    files = _sorted_image_files(view_dir)
+    if not files:
+        raise ValueError(f"无图像: {view_dir}")
+    n = len(files)
+    idx = np.linspace(0, n - 1, num=min(int(num_frames), n)).astype(int).tolist()
+    out = []
+    for i in idx:
+        im = cv2.imread(str(files[int(i)]), cv2.IMREAD_COLOR)
+        if im is None:
+            raise ValueError(f"无法读取: {files[int(i)]}")
+        out.append(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))
+    while len(out) < int(num_frames) and out:
+        out.append(out[-1].copy())
+    return out[: int(num_frames)]
+
+
+def extract_frames_from_video(path: Path, sample_fps: float, max_frames: int, out_size: int) -> np.ndarray:
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise ValueError(f"无法打开视频: {path}")
+    v_fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+    n_meta = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if n_meta <= 0:
+        cap.release()
+        raise ValueError(f"视频无帧元数据: {path}")
+    duration = n_meta / max(v_fps, 1e-3)
+    n_target = max(1, min(int(max_frames), int(round(duration * float(sample_fps)))))
+    idxs = np.linspace(0, n_meta - 1, num=min(n_target, n_meta)).astype(int).tolist()
+    want = set(idxs)
+    got: Dict[int, np.ndarray] = {}
+    fi = 0
+    while True:
+        ok, fr = cap.read()
+        if not ok:
+            break
+        if fi in want:
+            fr = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+            fr = cv2.resize(fr, (out_size, out_size))
+            got[fi] = fr.astype(np.float32) / 255.0
+        fi += 1
+    cap.release()
+    if not got:
+        raise ValueError(f"视频无帧: {path}")
+    ordered = [got[i] for i in sorted(got.keys())]
+    while len(ordered) < int(max_frames) and ordered:
+        ordered.append(ordered[-1])
+    return np.stack(ordered[: int(max_frames)], axis=0)
+
+
+def list_arch3_video_view_groups(videos_dir: Path) -> List[Tuple[str, Path, Path, Path]]:
+    if not videos_dir.is_dir():
+        return []
+    groups: Dict[str, Dict[str, Path]] = {}
+    for p in videos_dir.glob("*.mp4"):
+        stem = p.stem
+        if stem.endswith("_stress_gaussian"):
+            base = stem[: -len("_stress_gaussian")]
+            groups.setdefault(base, {})["stress"] = p
+        elif stem.endswith("_flow_gaussian"):
+            base = stem[: -len("_flow_gaussian")]
+            groups.setdefault(base, {})["flow"] = p
+        elif stem.endswith("_deformation"):
+            base = stem[: -len("_deformation")]
+            groups.setdefault(base, {})["flow"] = p
+        else:
+            groups.setdefault(stem, {})["rgb"] = p
+    out: List[Tuple[str, Path, Path, Path]] = []
+    for base in sorted(groups.keys()):
+        g = groups[base]
+        if "rgb" in g and "stress" in g and "flow" in g:
+            out.append((base, g["rgb"], g["stress"], g["flow"]))
+    return out
+
+
+def list_arch4_video_view_groups(videos_dir: Path) -> List[Tuple[str, Path, Path, Path, Path]]:
+    """每组须同时含 base RGB、stress_gaussian、flow_gaussian、force_mask 四个衍生 MP4。"""
+    if not videos_dir.is_dir():
+        return []
+    groups: Dict[str, Dict[str, Path]] = {}
+    for p in videos_dir.glob("*.mp4"):
+        stem = p.stem
+        if stem.endswith("_stress_gaussian"):
+            base = stem[: -len("_stress_gaussian")]
+            groups.setdefault(base, {})["stress"] = p
+        elif stem.endswith("_flow_gaussian"):
+            base = stem[: -len("_flow_gaussian")]
+            groups.setdefault(base, {})["flow"] = p
+        elif stem.endswith("_deformation"):
+            base = stem[: -len("_deformation")]
+            groups.setdefault(base, {})["flow"] = p
+        elif stem.endswith("_force_mask"):
+            base = stem[: -len("_force_mask")]
+            groups.setdefault(base, {})["force"] = p
+        else:
+            groups.setdefault(stem, {})["rgb"] = p
+    out: List[Tuple[str, Path, Path, Path, Path]] = []
+    for base in sorted(groups.keys()):
+        g = groups[base]
+        if "rgb" in g and "stress" in g and "flow" in g and "force" in g:
+            out.append((base, g["rgb"], g["stress"], g["flow"], g["force"]))
+    return out
+
+
+def _stack_view_images(view_dir: Path, num_frames: int, img_size: int) -> np.ndarray:
+    frames = extract_frames_from_images(view_dir, num_frames)
+    out = []
+    for f in frames:
+        f = cv2.resize(f, (img_size, img_size))
+        out.append(f)
+    arr = np.stack(out, axis=0).astype(np.float32) / 255.0
+    return np.ascontiguousarray(np.transpose(arr, (0, 3, 1, 2)))
+
+
+def _pad_views_vcthw(x: np.ndarray, max_views: int) -> np.ndarray:
+    v = int(x.shape[0])
+    if v >= max_views:
+        return x[:max_views]
+    out = np.zeros((max_views,) + tuple(x.shape[1:]), dtype=np.float32)
+    if v <= 0:
+        return out
+    out[:v] = x
+    if v < max_views:
+        out[v:] = x[v - 1 : v]
+    return out
+
+
+def _torch_load_pt(path: Path):
     try:
-        _action, _params, _reg = _load_gt_from_dir(sample_dir)
-        image_dir = sample_dir / "images"
-        frames = extract_frames_from_images(image_dir, num_frames)
-        for f in frames:
-            _ = cv2.resize(f, (img_size, img_size))
-        return True
-    except Exception:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def list_arch4_tensor_stems(cache_dir: Path) -> List[str]:
+    p = Path(cache_dir)
+    if not p.is_dir():
+        return []
+    return sorted({x.stem for x in p.glob("*.pt") if x.is_file()})
+
+
+def _pt_full_pack(obj: object) -> bool:
+    if not isinstance(obj, dict) or int(obj.get("version", 1)) < 2:
         return False
+    for k in ("rgb", "stress", "flow"):
+        if k not in obj:
+            return False
+        t = obj[k]
+        if not isinstance(t, torch.Tensor):
+            t = torch.as_tensor(t)
+        if t.dim() != 4 or int(t.shape[0]) != 3:
+            return False
+    return True
 
 
-class Dataset400(Dataset):
-    """
-    读取 auto_output/dataset_400/{train|test}/<id>/ 下的扁平样本。
-    gt.json 提供 action、params（材质等）与 regression（E, nu, density, yield_stress）。
-    """
+def _pt_has_force_mask_tensor(obj: dict) -> bool:
+    if "force_mask" not in obj or obj["force_mask"] is None:
+        return False
+    t = obj["force_mask"]
+    if not isinstance(t, torch.Tensor):
+        t = torch.as_tensor(t)
+    return t.dim() == 4 and int(t.shape[0]) == 3
+
+
+def _resample_chw(x: torch.Tensor, target_t: int) -> torch.Tensor:
+    t = int(x.shape[1])
+    T = int(target_t)
+    if t == T:
+        return x.float()
+    idx = torch.linspace(0, t - 1, T).long()
+    return x[:, idx].contiguous().float()
+
+
+def _load_full_pack(obj: dict, target_t: int, img_size: int, path_hint: str = "") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not _pt_full_pack(obj):
+        raise ValueError(f"{path_hint}: 需要 version>=2 且含 rgb,stress,flow")
+    outs = []
+    for k in ("rgb", "stress", "flow"):
+        t = _resample_chw(obj[k] if isinstance(obj[k], torch.Tensor) else torch.as_tensor(obj[k]), target_t)
+        if int(t.shape[2]) != img_size or int(t.shape[3]) != img_size:
+            raise ValueError(f"{path_hint} {k}: 空间应为 {img_size}")
+        outs.append(t)
+    return outs[0], outs[1], outs[2]
+
+
+def _load_force_mask_from_pt(obj: dict, target_t: int, img_size: int, path_hint: str) -> torch.Tensor:
+    if not _pt_has_force_mask_tensor(obj):
+        raise ValueError(f"{path_hint}: .pt 中缺少有效的 force_mask [3,T,H,W]")
+    t = obj["force_mask"] if isinstance(obj["force_mask"], torch.Tensor) else torch.as_tensor(obj["force_mask"])
+    t = _resample_chw(t, target_t)
+    if int(t.shape[2]) != img_size or int(t.shape[3]) != img_size:
+        raise ValueError(f"{path_hint} force_mask: 空间应为 {img_size}")
+    return t
+
+
+def _tensor_views_ok(sample_dir: Path, subdir: str, max_views: int) -> bool:
+    cache = sample_dir / subdir
+    stems = list_arch4_tensor_stems(cache)[:max_views]
+    if not stems:
+        return False
+    img_root = sample_dir / "images"
+    sg = sample_dir / "stress_gaussian"
+    fg = sample_dir / "flow_gaussian"
+    fm_root = sample_dir / "force_mask"
+    for vn in stems:
+        p = cache / f"{vn}.pt"
+        if not p.is_file():
+            return False
+        try:
+            o = _torch_load_pt(p)
+        except Exception:
+            return False
+        if isinstance(o, dict) and _pt_full_pack(o):
+            if _pt_has_force_mask_tensor(o):
+                continue
+            fmd = fm_root / vn
+            if fmd.is_dir() and _sorted_image_files(fmd):
+                continue
+            return False
+        if not (img_root / vn).is_dir() or not _sorted_image_files(img_root / vn):
+            return False
+        if not (sg / vn).is_dir() or not (fg / vn).is_dir():
+            return False
+        if not (fm_root / vn).is_dir():
+            return False
+        if (
+            not _sorted_image_files(sg / vn)
+            or not _sorted_image_files(fg / vn)
+            or not _sorted_image_files(fm_root / vn)
+        ):
+            return False
+    return True
+
+
+class DatasetArch4(Dataset):
+    """images 单通道时序输入，stress/flow/force_mask 单通道时序监督 + ``gt.json`` 参数回归。"""
 
     def __init__(
         self,
         split_root: Path,
-        num_frames: int = 16,
         img_size: int = 224,
+        max_views: int = 4,
+        source: str = "auto",
+        input_mode: str = "rgb+force_mask",
+        tensor_subdir: str = "arch4_tensors",
+        lmdb_env_subdir: str = "arch4_data.lmdb",
+        video_sample_fps: float = 30.0,
+        num_frames: int = 30,
         preflight: bool = True,
-        verbose_preflight: bool = True,
+        verbose: bool = True,
+        sample_ids: Optional[List[str]] = None,
+        return_sample_id: bool = False,
     ):
         self.split_root = Path(split_root)
-        self.num_frames = num_frames
-        self.img_size = img_size
+        self.img_size = int(img_size)
+        self.max_views = int(max_views)
+        self.source = str(source).strip().lower() or "auto"
+        self.input_mode = str(input_mode).strip().lower()
+        self.tensor_subdir = str(tensor_subdir).strip().strip("/\\") or "arch4_tensors"
+        self.lmdb_env_subdir = str(lmdb_env_subdir).strip().strip("/\\") or "arch4_data.lmdb"
+        self.video_sample_fps = float(video_sample_fps)
+        self.num_frames = int(num_frames)
+        self.sample_ids = list(sample_ids) if sample_ids is not None else None
+        self.return_sample_id = bool(return_sample_id)
 
-        self.sample_dirs: List[Path] = []
-        all_dirs = list_dataset400_sample_dirs(self.split_root)
-        if preflight and verbose_preflight:
-            print(
-                f"[Dataset400] 预检：共 {len(all_dirs)} 个编号目录，每 {max(1, len(all_dirs) // 20)} 个打印一次进度…",
-                flush=True,
-            )
-        step_prog = max(1, len(all_dirs) // 20) if len(all_dirs) > 20 else 5
+        self.samples: List[Path] = []
+        self.layout: Dict[str, str] = {}
+        T, H = self.num_frames, self.img_size
 
-        for di, d in enumerate(all_dirs):
-            if preflight and verbose_preflight and di > 0 and di % step_prog == 0:
-                print(f"[Dataset400] 预检进度 {di}/{len(all_dirs)} …", flush=True)
-            gt_path = d / "gt.json"
-            img_dir = d / "images"
-            if not gt_path.is_file() or not img_dir.is_dir():
+        if self.sample_ids is None:
+            iter_dirs = list_dataset400_sample_dirs(self.split_root)
+        else:
+            iter_dirs = [self.split_root / str(sid) for sid in self.sample_ids]
+
+        for d in iter_dirs:
+            if not d.is_dir():
                 continue
-            # preflight=False（--no_dataset_preflight）时不再 cv2 读首帧，否则 NFS 上仍要几百次 imread，启动很慢
-            if preflight:
-                if not is_image_sequence_readable(img_dir):
-                    if verbose_preflight:
-                        print(f"[Dataset400] 跳过（首帧不可读）: {d}", flush=True)
-                    continue
-            else:
-                if not _images_dir_has_any_frame(img_dir):
-                    if verbose_preflight:
-                        print(f"[Dataset400] 跳过（images 下无图片文件）: {d}", flush=True)
-                    continue
-            if preflight:
-                if not dataset400_sample_fully_readable(d, num_frames, img_size):
-                    if verbose_preflight:
-                        print(
-                            f"[Dataset400] 跳过（完整加载失败；常见：PNG 损坏，或 gt.json 数值异常）: {d}",
-                            flush=True,
-                        )
-                    continue
-            self.sample_dirs.append(d)
+            if not (d / "gt.json").is_file():
+                continue
+            lay = self._resolve_layout(d)
+            if lay is None:
+                continue
+            if preflight and not self._preflight(d, lay, T, H, verbose):
+                continue
+            k = str(d.resolve())
+            self.layout[k] = lay
+            self.samples.append(d)
 
-        if not self.sample_dirs:
+        if not self.samples:
             raise ValueError(
-                f"Dataset400: 在 {self.split_root} 下没有可用样本（请检查 gt.json / images 或关闭 preflight 自行承担风险）"
+                f"DatasetArch4: 无可用样本（需 LMDB / 视频五元组 / PNG 四目录 / .pt）；source={self.source!r}"
             )
+
+    def _has_arch4_lmdb(self, d: Path) -> bool:
+        return lmdb_arch4_is_valid(d / self.lmdb_env_subdir)
+
+    def _has_png_quad(self, d: Path) -> bool:
+        sg = d / "stress_gaussian"
+        if not sg.is_dir():
+            return False
+        views = list_multiview_camera_dirs(sg)[: self.max_views]
+        if not views:
+            return False
+        img_root, fg, fm_root = d / "images", d / "flow_gaussian", d / "force_mask"
+        for vn in views:
+            if not (img_root / vn).is_dir() or not _sorted_image_files(img_root / vn):
+                return False
+            if not (fg / vn).is_dir() or not _sorted_image_files(fg / vn):
+                return False
+            if not _sorted_image_files(sg / vn):
+                return False
+            if not (fm_root / vn).is_dir() or not _sorted_image_files(fm_root / vn):
+                return False
+        return True
+
+    def _resolve_layout(self, d: Path) -> Optional[str]:
+        has_m = self._has_arch4_lmdb(d)
+        has_v = len(list_arch4_video_view_groups(d / "videos")) > 0
+        has_t = _tensor_views_ok(d, self.tensor_subdir, self.max_views)
+        has_i = self._has_png_quad(d)
+        if self.source == "lmdb":
+            return "lmdb" if has_m else None
+        if self.source == "video":
+            return "video" if has_v else None
+        if self.source == "tensors":
+            return "tensors" if has_t else None
+        if self.source == "images":
+            return "images" if has_i else None
+        if has_m:
+            return "lmdb"
+        if has_v:
+            return "video"
+        if has_t:
+            return "tensors"
+        if has_i:
+            return "images"
+        return None
+
+    def _preflight(self, d: Path, lay: str, T: int, H: int, verbose: bool) -> bool:
+        try:
+            if lay == "lmdb":
+                read_arch4_lmdb_view_tensors(
+                    d / self.lmdb_env_subdir,
+                    num_frames=T,
+                    img_size=H,
+                    max_views=self.max_views,
+                )
+            elif lay == "video":
+                for _b, pr, ps, pf, pfm in list_arch4_video_view_groups(d / "videos")[: self.max_views]:
+                    extract_frames_from_video(pr, self.video_sample_fps, T, H)
+                    extract_frames_from_video(ps, self.video_sample_fps, T, H)
+                    extract_frames_from_video(pf, self.video_sample_fps, T, H)
+                    extract_frames_from_video(pfm, self.video_sample_fps, T, H)
+            elif lay == "tensors":
+                cache = d / self.tensor_subdir
+                for vn in list_arch4_tensor_stems(cache)[: self.max_views]:
+                    p = cache / f"{vn}.pt"
+                    o = _torch_load_pt(p)
+                    if isinstance(o, dict) and _pt_full_pack(o):
+                        _load_full_pack(o, T, H, str(p))
+                        if _pt_has_force_mask_tensor(o):
+                            _load_force_mask_from_pt(o, T, H, str(p))
+                        else:
+                            _stack_view_images(d / "force_mask" / vn, T, H)
+                    else:
+                        _stack_view_images(d / "images" / vn, T, H)
+                        _stack_view_images(d / "stress_gaussian" / vn, T, H)
+                        _stack_view_images(d / "flow_gaussian" / vn, T, H)
+                        _stack_view_images(d / "force_mask" / vn, T, H)
+            else:
+                sg = d / "stress_gaussian"
+                for vn in list_multiview_camera_dirs(sg)[: self.max_views]:
+                    _stack_view_images(d / "images" / vn, T, H)
+                    _stack_view_images(sg / vn, T, H)
+                    _stack_view_images(d / "flow_gaussian" / vn, T, H)
+                    _stack_view_images(d / "force_mask" / vn, T, H)
+            return True
+        except Exception as e:
+            if verbose:
+                print(f"[DatasetArch4] 跳过 {d}: {e}", flush=True)
+            return False
 
     def __len__(self) -> int:
-        return len(self.sample_dirs)
+        return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        sample_dir = self.sample_dirs[idx]
-        image_dir = sample_dir / "images"
-        action, params, reg = _load_gt_from_dir(sample_dir)
-        frames = extract_frames_from_images(image_dir, self.num_frames)
+    def __getitem__(
+        self, idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        d = self.samples[idx]
+        lay = self.layout[str(d.resolve())]
+        T, H, mv = self.num_frames, self.img_size, self.max_views
 
-        frames_resized = []
-        for f in frames:
-            f = cv2.resize(f, (self.img_size, self.img_size))
-            frames_resized.append(f)
-        frames = np.stack(frames_resized, axis=0).astype(np.float32) / 255.0
-        frames = np.ascontiguousarray(np.transpose(frames, (0, 3, 1, 2)))
+        def thwc_tchw(a: np.ndarray) -> np.ndarray:
+            return np.ascontiguousarray(np.transpose(a.astype(np.float32), (0, 3, 1, 2)))
 
-        params_tensor = torch.tensor(
-            [reg["E"], reg["nu"], reg["density"], reg["yield_stress"]],
-            dtype=torch.float32,
+        rgb_l, s_l, f_l, fm_l = [], [], [], []
+        if lay == "lmdb":
+            rl, sl, fl, fml = read_arch4_lmdb_view_tensors(
+                d / self.lmdb_env_subdir,
+                num_frames=T,
+                img_size=H,
+                max_views=mv,
+            )
+            for a in rl:
+                rgb_l.append(np.ascontiguousarray(a))
+            for a in sl:
+                s_l.append(np.ascontiguousarray(a))
+            for a in fl:
+                f_l.append(np.ascontiguousarray(a))
+            for a in fml:
+                fm_l.append(np.ascontiguousarray(a))
+        elif lay == "video":
+            for _b, pr, ps, pf, pfm in list_arch4_video_view_groups(d / "videos")[:mv]:
+                rgb_l.append(thwc_tchw(extract_frames_from_video(pr, self.video_sample_fps, T, H)))
+                s_l.append(thwc_tchw(extract_frames_from_video(ps, self.video_sample_fps, T, H)))
+                f_l.append(thwc_tchw(extract_frames_from_video(pf, self.video_sample_fps, T, H)))
+                fm_l.append(thwc_tchw(extract_frames_from_video(pfm, self.video_sample_fps, T, H)))
+        elif lay == "tensors":
+            cache = d / self.tensor_subdir
+            for vn in list_arch4_tensor_stems(cache)[:mv]:
+                p = cache / f"{vn}.pt"
+                o = _torch_load_pt(p)
+                if isinstance(o, dict) and _pt_full_pack(o):
+                    r, ss, ff = _load_full_pack(o, T, H, str(p))
+                    rgb_l.append(np.ascontiguousarray(r.cpu().numpy()))
+                    s_l.append(np.ascontiguousarray(ss.cpu().numpy()))
+                    f_l.append(np.ascontiguousarray(ff.cpu().numpy()))
+                    if _pt_has_force_mask_tensor(o):
+                        fmm = _load_force_mask_from_pt(o, T, H, str(p))
+                        fm_l.append(np.ascontiguousarray(fmm.cpu().numpy()))
+                    else:
+                        fm_l.append(_stack_view_images(d / "force_mask" / vn, T, H))
+                else:
+                    rgb_l.append(_stack_view_images(d / "images" / vn, T, H))
+                    s_l.append(_stack_view_images(d / "stress_gaussian" / vn, T, H))
+                    f_l.append(_stack_view_images(d / "flow_gaussian" / vn, T, H))
+                    fm_l.append(_stack_view_images(d / "force_mask" / vn, T, H))
+        else:
+            sg = d / "stress_gaussian"
+            for vn in list_multiview_camera_dirs(sg)[:mv]:
+                rgb_l.append(_stack_view_images(d / "images" / vn, T, H))
+                s_l.append(_stack_view_images(sg / vn, T, H))
+                f_l.append(_stack_view_images(d / "flow_gaussian" / vn, T, H))
+                fm_l.append(_stack_view_images(d / "force_mask" / vn, T, H))
+
+        if not rgb_l:
+            z3 = np.zeros((1, 3, T, H, H), np.float32)
+            rgb = s = f = fm = z3
+        else:
+            rgb = np.stack(rgb_l, 0)
+            s = np.stack(s_l, 0)
+            f = np.stack(f_l, 0)
+            fm = np.stack(fm_l, 0)
+        rgb, s, f, fm = (
+            _pad_views_vcthw(rgb, mv),
+            _pad_views_vcthw(s, mv),
+            _pad_views_vcthw(f, mv),
+            _pad_views_vcthw(fm, mv),
         )
-        material_idx = material_to_idx(params.get("material", "plasticine"))
-        action_idx = action_to_idx(action)
+        # LMDB/PNG里各模态是“彩色存储但三通道等值”，训练统一转为单通道时序。
+        def _to_single_channel(vcthw: np.ndarray) -> np.ndarray:
+            # 输入 [V,3,T,H,W] -> 输出 [V,1,T,H,W]，直接取第0通道避免重复信息和计算浪费。
+            if vcthw.ndim != 5 or int(vcthw.shape[1]) < 1:
+                raise ValueError(f"expect [V,C,T,H,W], got {vcthw.shape}")
+            return np.ascontiguousarray(vcthw[:, 0:1, ...], dtype=np.float32)
 
-        frames_t = torch.tensor(frames, dtype=torch.float32)
-        return (
-            frames_t,
-            params_tensor,
-            torch.tensor(material_idx, dtype=torch.long),
-            torch.tensor(action_idx, dtype=torch.long),
+        rgb = _to_single_channel(rgb)
+        s = _to_single_channel(s)
+        f = _to_single_channel(f)
+        fm = _to_single_channel(fm)
+
+        # 重新设计后输入固定为 images 时序（不再把 force_mask 叠到输入通道）
+        x_in = rgb
+
+        _, _, reg = _load_gt_from_dir(d)
+        params = torch.tensor(
+            [reg["E"], reg["nu"], reg["density"], reg["yield_stress"]], dtype=torch.float32
         )
 
+        base_out = (
+            torch.from_numpy(np.ascontiguousarray(x_in)),
+            torch.from_numpy(np.ascontiguousarray(s)),
+            torch.from_numpy(np.ascontiguousarray(f)),
+            torch.from_numpy(np.ascontiguousarray(fm)),
+            params,
+        )
 
-def train_test_split(
-    auto_output_root: Path, train_ratio: float = 0.7, seed: int = 42
-) -> Tuple[List[Tuple[str, Path, Dict]], List[Tuple[str, Path, Dict]]]:
-    """按 7:3 分割训练集和测试集"""
-    import random
-
-    samples = [
-        (action, run_dir, params)
-        for action, run_dir, params in iter_auto_output_runs(Path(auto_output_root))
-    ]
-    img_samples = []
-    for action, run_dir, params in samples:
-        image_dir = find_images_dir(run_dir)
-        if image_dir is not None and is_image_sequence_readable(image_dir):
-            img_samples.append((action, run_dir, params))
-
-    rng = random.Random(seed)
-    rng.shuffle(img_samples)
-    n_train = int(len(img_samples) * train_ratio)
-    return img_samples[:n_train], img_samples[n_train:]
+        if self.return_sample_id:
+            return (*base_out, d.name)
+        return base_out

@@ -1,0 +1,91 @@
+{
+  "sample_dir": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/auto_output/dataset_deformation_stress_500_new/train/000000",
+  "lmdb_path": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/auto_output/dataset_deformation_stress_500_new/train/000000/arch4_data.lmdb",
+  "meta": {
+    "format_version": 1,
+    "magic": "PG4_LMDB_v1",
+    "img_size": 224,
+    "views": [
+      "az153_el13",
+      "az198_el13",
+      "az257_el13"
+    ],
+    "modalities": [
+      "rgb",
+      "stress",
+      "flow",
+      "force_mask"
+    ],
+    "num_frames": 64
+  },
+  "first_view": "az153_el13",
+  "storage_format": {
+    "rgb": {
+      "exists": true,
+      "key": "az153_el13/rgb",
+      "shape_TCHW": [
+        64,
+        3,
+        224,
+        224
+      ],
+      "dtype": "uint8",
+      "is_true_rgb": true
+    },
+    "stress": {
+      "exists": true,
+      "key": "az153_el13/stress",
+      "shape_TCHW": [
+        64,
+        3,
+        224,
+        224
+      ],
+      "dtype": "uint8",
+      "is_true_rgb": true
+    },
+    "flow": {
+      "exists": true,
+      "key": "az153_el13/flow",
+      "shape_TCHW": [
+        64,
+        3,
+        224,
+        224
+      ],
+      "dtype": "uint8",
+      "is_true_rgb": true
+    },
+    "force_mask": {
+      "exists": true,
+      "key": "az153_el13/force_mask",
+      "shape_TCHW": [
+        64,
+        3,
+        224,
+        224
+      ],
+      "dtype": "uint8",
+      "is_true_rgb": true
+    }
+  },
+  "rgb_preview_saved": true,
+  "rgb_preview_files": [
+    "logic_model/lmdb_preview/rgb_view00_frame000.png",
+    "logic_model/lmdb_preview/rgb_view00_frame001.png",
+    "logic_model/lmdb_preview/rgb_view01_frame000.png",
+    "logic_model/lmdb_preview/rgb_view01_frame001.png",
+    "logic_model/lmdb_preview/stress_view00_frame000.png",
+    "logic_model/lmdb_preview/stress_view00_frame001.png",
+    "logic_model/lmdb_preview/stress_view01_frame000.png",
+    "logic_model/lmdb_preview/stress_view01_frame001.png",
+    "logic_model/lmdb_preview/flow_view00_frame000.png",
+    "logic_model/lmdb_preview/flow_view00_frame001.png",
+    "logic_model/lmdb_preview/flow_view01_frame000.png",
+    "logic_model/lmdb_preview/flow_view01_frame001.png",
+    "logic_model/lmdb_preview/force_mask_view00_frame000.png",
+    "logic_model/lmdb_preview/force_mask_view00_frame001.png",
+    "logic_model/lmdb_preview/force_mask_view01_frame000.png",
+    "logic_model/lmdb_preview/force_mask_view01_frame001.png"
+  ]
+}

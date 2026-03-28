@@ -1,0 +1,445 @@
+{
+  "meta": {
+    "split_root": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/auto_output/dataset_10/train",
+    "sample_index": 0,
+    "sample_id": [
+      "000000"
+    ],
+    "action_name": [
+      "shear"
+    ],
+    "action_label": [
+      0
+    ],
+    "action_to_id": {
+      "shear": 0
+    },
+    "device": "cpu",
+    "model_num_frames": 64
+  },
+  "input": {
+    "x": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.8352941274642944,
+      "mean": 0.07433236390352249,
+      "std": 0.200045645236969,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "stress_gt": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.929411768913269,
+      "mean": 0.060559142380952835,
+      "std": 0.17097967863082886,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "flow_gt": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.03275138512253761,
+      "std": 0.12846782803535461,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "force_gt": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.06658120453357697,
+      "std": 0.19925004243850708,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "object_gt": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        224,
+        224
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.9960784316062927,
+      "mean": 0.13790413737297058,
+      "std": 0.3395269215106964,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "params_gt_raw": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 6215.53271484375,
+      "mean": 1806.9769287109375,
+      "std": 2578.578857421875,
+      "values_head": [
+        6215.53271484375,
+        0.40135297179222107,
+        1011.9736328125,
+        0.0
+      ]
+    },
+    "params_gt_train_space": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 8.734967231750488,
+      "mean": 4.0142412185668945,
+      "std": 3.869739294052124,
+      "values_head": [
+        8.734967231750488,
+        0.40135297179222107,
+        6.920645236968994,
+        0.0
+      ]
+    }
+  },
+  "bottleneck": {
+    "contact_latent": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.float32",
+      "min": -0.06718175113201141,
+      "max": 0.07080808281898499,
+      "mean": -0.0007679713307879865,
+      "std": 0.032661307603120804,
+      "values_head": [
+        -0.031153792515397072,
+        0.048360686749219894,
+        -0.045927636325359344,
+        0.005218624137341976,
+        0.023968474939465523,
+        -0.03547630459070206,
+        0.054800935089588165,
+        0.0394112691283226
+      ]
+    },
+    "deformation_latent": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.float32",
+      "min": -0.0641736164689064,
+      "max": 0.062352754175662994,
+      "mean": 0.0010648381430655718,
+      "std": 0.030598320066928864,
+      "values_head": [
+        0.0031653675250709057,
+        0.002240934642031789,
+        -0.026969557628035545,
+        0.05821977183222771,
+        -0.03097878210246563,
+        -0.029882345348596573,
+        -0.02793179824948311,
+        -0.03567032888531685
+      ]
+    },
+    "stress_latent": {
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "torch.float32",
+      "min": -0.07024714350700378,
+      "max": 0.07976126670837402,
+      "mean": 0.004126963671296835,
+      "std": 0.03618874028325081,
+      "values_head": [
+        -0.007509490475058556,
+        -0.005789732560515404,
+        0.04763626307249069,
+        0.04205342382192612,
+        0.03942858427762985,
+        0.0013901228085160255,
+        0.07382064312696457,
+        0.048918597400188446
+      ]
+    }
+  },
+  "predictions": {
+    "param_pred": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.2570810317993164,
+      "max": 0.6637646555900574,
+      "mean": 0.5568286180496216,
+      "std": 0.17311303317546844,
+      "values_head": [
+        0.6536831855773926,
+        0.2570810317993164,
+        0.6527856588363647,
+        0.6637646555900574
+      ]
+    },
+    "param_pred_raw": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.2570810317993164,
+      "max": 0.9420899152755737,
+      "mean": 0.7606661319732666,
+      "std": 0.2908641993999481,
+      "values_head": [
+        0.9226091504096985,
+        0.2570810317993164,
+        0.9208843111991882,
+        0.9420899152755737
+      ]
+    },
+    "action_logits": {
+      "shape": [
+        1,
+        1
+      ],
+      "dtype": "torch.float32",
+      "min": 0.03920795023441315,
+      "max": 0.03920795023441315,
+      "mean": 0.03920795023441315,
+      "std": 0.0,
+      "values_head": [
+        0.03920795023441315
+      ]
+    },
+    "action_prob": [
+      [
+        1.0
+      ]
+    ],
+    "action_pred": [
+      0
+    ],
+    "stress_field_pred": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        112,
+        112
+      ],
+      "dtype": "torch.float32",
+      "min": -2.0522336959838867,
+      "max": 2.0325512886047363,
+      "mean": 8.050085853028577e-06,
+      "std": 0.4036727547645569,
+      "values_head": [
+        0.5181305408477783,
+        -0.14440111815929413,
+        0.49588990211486816,
+        -0.36430561542510986,
+        0.13782232999801636,
+        -0.2869441509246826,
+        0.039326831698417664,
+        -0.15252776443958282
+      ]
+    },
+    "flow_field_pred": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        112,
+        112
+      ],
+      "dtype": "torch.float32",
+      "min": -1.95638906955719,
+      "max": 2.048383951187134,
+      "mean": -0.002739974996075034,
+      "std": 0.3994007706642151,
+      "values_head": [
+        -0.48872295022010803,
+        0.4944678246974945,
+        0.0728493332862854,
+        -0.2920520603656769,
+        0.2574511170387268,
+        -0.13385865092277527,
+        -0.5678801536560059,
+        0.03370782732963562
+      ]
+    },
+    "force_pred": {
+      "shape": [
+        1,
+        3,
+        3,
+        64,
+        112,
+        112
+      ],
+      "dtype": "torch.float32",
+      "min": -2.152369737625122,
+      "max": 2.158726930618286,
+      "mean": -7.208206807263196e-05,
+      "std": 0.41443347930908203,
+      "values_head": [
+        0.44601792097091675,
+        0.0665842741727829,
+        -0.5799157619476318,
+        0.2014295756816864,
+        0.2813546657562256,
+        0.054414890706539154,
+        0.3080105185508728,
+        0.558822751045227
+      ]
+    },
+    "logvar": {
+      "shape": [
+        1,
+        4
+      ],
+      "dtype": "torch.float32",
+      "min": 0.0,
+      "max": 0.0,
+      "mean": 0.0,
+      "std": 0.0,
+      "values_head": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "loss": {
+    "loss_total": 4.759536266326904,
+    "loss_reg": 4.453183650970459,
+    "loss_stress": 0.19595205783843994,
+    "loss_flow": 0.17739401757717133,
+    "loss_force": 0.2154879868030548,
+    "loss_action": 0.0,
+    "action_acc": 1.0,
+    "loss_phys_total": 2.1802759170532227,
+    "loss_stress_flow_consistency": 0.7416964173316956,
+    "loss_force_stress_consistency": 0.7197648882865906,
+    "loss_force_flow_consistency": 0.7188146710395813
+  },
+  "grad_norm": {
+    "global_before_clip": 0.5660584568977356,
+    "encoder": 0.4970390037859627,
+    "fusion": 0.0037138111644435083,
+    "physics_bottleneck": 0.005416487755112292,
+    "param_head": 0.24181500552739402,
+    "action_head": 0.0,
+    "stress_head": 0.06026015523168715,
+    "flow_head": 0.05961043933179818,
+    "force_head": 0.06117212116595017
+  },
+  "preview": {
+    "dir": "/KAIROS_vepfs-2/KAIROS_vepfs/huangtao/intern/linrui/PhysGaussian/logic_model/train_step_preview_dataset10",
+    "files": [
+      "logic_model/train_step_preview_dataset10/rgb_view00_frame000.png",
+      "logic_model/train_step_preview_dataset10/rgb_view00_frame001.png",
+      "logic_model/train_step_preview_dataset10/rgb_view01_frame000.png",
+      "logic_model/train_step_preview_dataset10/rgb_view01_frame001.png",
+      "logic_model/train_step_preview_dataset10/stress_gt_view00_frame000.png",
+      "logic_model/train_step_preview_dataset10/stress_gt_view00_frame001.png",
+      "logic_model/train_step_preview_dataset10/stress_gt_view01_frame000.png",
+      "logic_model/train_step_preview_dataset10/stress_gt_view01_frame001.png",
+      "logic_model/train_step_preview_dataset10/flow_gt_view00_frame000.png",
+      "logic_model/train_step_preview_dataset10/flow_gt_view00_frame001.png",
+      "logic_model/train_step_preview_dataset10/flow_gt_view01_frame000.png",
+      "logic_model/train_step_preview_dataset10/flow_gt_view01_frame001.png",
+      "logic_model/train_step_preview_dataset10/force_gt_view00_frame000.png",
+      "logic_model/train_step_preview_dataset10/force_gt_view00_frame001.png",
+      "logic_model/train_step_preview_dataset10/force_gt_view01_frame000.png",
+      "logic_model/train_step_preview_dataset10/force_gt_view01_frame001.png",
+      "logic_model/train_step_preview_dataset10/object_gt_view00_frame000.png",
+      "logic_model/train_step_preview_dataset10/object_gt_view00_frame001.png",
+      "logic_model/train_step_preview_dataset10/object_gt_view01_frame000.png",
+      "logic_model/train_step_preview_dataset10/object_gt_view01_frame001.png"
+    ]
+  }
+}
