@@ -11,18 +11,70 @@ if _QUIET_EARLY:
 sys.path.append("gaussian-splatting")
 import argparse
 import contextlib
+import ctypes
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
-import torch
 import os
 import numpy as np
 import json
 import subprocess
 import glob
 import shutil
+import re
 from tqdm import tqdm
+
+def _ensure_maca_runtime_libs() -> None:
+    maca_root = os.environ.get("MACA_PATH", "/opt/maca-3.3.0")
+    candidate_dirs = [
+        os.path.join(maca_root, "tools", "cu-bridge", "lib"),
+        os.path.join(maca_root, "lib"),
+        os.path.join(maca_root, "ompi", "lib"),
+        os.path.join(maca_root, "ucx", "lib"),
+    ]
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    for d in reversed(candidate_dirs):
+        if os.path.exists(d) and d not in parts:
+            parts.insert(0, d)
+    if parts:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(parts)
+    preload_libs = [
+        os.path.join(maca_root, "ompi", "lib", "libopen-pal.so.40"),
+        os.path.join(maca_root, "ompi", "lib", "libopen-rte.so.40"),
+        os.path.join(maca_root, "ompi", "lib", "libmpi.so.40"),
+        os.path.join(maca_root, "ucx", "lib", "libucs.so.0"),
+        os.path.join(maca_root, "ucx", "lib", "libuct.so.0"),
+        os.path.join(maca_root, "ucx", "lib", "libucp.so.0"),
+    ]
+    for lib in preload_libs:
+        if os.path.exists(lib):
+            try:
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_ensure_maca_runtime_libs()
+import torch
+
+# MetaX/cu-bridge 兼容：确保 Warp 可通过 libcuda.so 兼容链接找到运行库。
+def _ensure_maca_cuda_compat_libs() -> None:
+    candidate_dirs = [
+        "/opt/maca-3.3.0/tools/cu-bridge/lib",
+        "/opt/maca-3.3.0/lib",
+    ]
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    for d in candidate_dirs:
+        if os.path.exists(d) and d not in parts:
+            parts.insert(0, d)
+    if parts:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(parts)
+
+
+_ensure_maca_cuda_compat_libs()
 
 # Gaussian splatting dependencies
 from utils.sh_utils import eval_sh
@@ -104,34 +156,66 @@ def _select_best_gpu() -> None:
     if os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() != "":
         # 已由外部指定（如 auto_simulation_runner 多卡分配），不再自动选择
         return
-    try:
+    def _query_gpus_from_nvidia_smi():
         result = subprocess.check_output(
             [
                 "nvidia-smi",
                 "--query-gpu=index,memory.free,utilization.gpu",
                 "--format=csv,noheader,nounits",
-            ]
+            ],
+            text=True,
         )
-        lines = result.decode("utf-8").strip().split("\n")
-
-        candidates = []
-        if not _gpu_quiet:
-            print("[modified_simulation] GPU status from nvidia-smi:")
-        for line in lines:
+        out = []
+        for line in result.strip().split("\n"):
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != 3:
                 continue
-            gpu_id = int(parts[0])
-            mem_free = int(parts[1])  # MiB
-            util = int(parts[2])      # %
-            candidates.append((gpu_id, mem_free, util))
+            out.append((int(parts[0]), int(parts[1]), int(parts[2])))
+        return out, "nvidia-smi"
+
+    def _query_gpus_from_mx_smi():
+        # mx-smi 不支持 nvidia-smi 的 query-gpu 参数，改为解析文本输出：
+        # GPU#<id> ... Utilization(GPU %) ... Memory(vram total/used, KB)
+        result = subprocess.check_output(
+            ["mx-smi", "--show-memory", "--show-usage"],
+            text=True,
+        )
+        blocks = re.split(r"\nGPU#(\d+)\s+", result)
+        out = []
+        for i in range(1, len(blocks), 2):
+            gpu_id = int(blocks[i])
+            block = blocks[i + 1]
+            m_total = re.search(r"vram total\s*:\s*(\d+)\s*KB", block)
+            m_used = re.search(r"vram used\s*:\s*(\d+)\s*KB", block)
+            m_util = re.search(r"GPU\s*:\s*(\d+)\s*%", block)
+            if not (m_total and m_used and m_util):
+                continue
+            total_kb = int(m_total.group(1))
+            used_kb = int(m_used.group(1))
+            util = int(m_util.group(1))
+            mem_free_mib = max(total_kb - used_kb, 0) // 1024
+            out.append((gpu_id, mem_free_mib, util))
+        return out, "mx-smi"
+
+    try:
+        # 优先适配 MetaX 机器；若没有 mx-smi，再走 nvidia-smi
+        candidates = []
+        source = None
+        try:
+            candidates, source = _query_gpus_from_mx_smi()
+        except Exception:
+            candidates, source = _query_gpus_from_nvidia_smi()
+
+        if not _gpu_quiet:
+            print(f"[modified_simulation] GPU status from {source}:")
+        for gpu_id, mem_free, util in candidates:
             if not _gpu_quiet:
                 print(f"  - GPU {gpu_id}: free_mem={mem_free} MiB, util={util}%")
 
         if not candidates:
             if not _gpu_quiet:
                 print(
-                    "[modified_simulation] nvidia-smi returned no GPU info, using default CUDA device."
+                    "[modified_simulation] no GPU info returned, using default CUDA device."
                 )
             return
 
@@ -154,17 +238,50 @@ def _select_best_gpu() -> None:
 # 在 Warp / Taichi 初始化之前自动选择显卡
 _select_best_gpu()
 
+def _init_warp_taichi_backends() -> None:
+    wp.init()
+    wp.config.verify_cuda = True
+    try:
+        ti.init(arch=ti.cuda, device_memory_GB=8.0)
+    except Exception as e:
+        msg = str(e)
+        # MetaX/cu-bridge 常见：cuMemGetInfo_v2 在兼容层返回 NOT_SUPPORTED
+        if ("CUDA_ERROR_NOT_SUPPORTED" in msg) or ("cuMemGetInfo_v2" in msg):
+            print(
+                "[modified_simulation] Taichi CUDA backend unsupported on current driver "
+                "(cuMemGetInfo_v2). Fallback to ti.cpu."
+            )
+            ti.init(arch=ti.cpu)
+        else:
+            raise
+
+
 if _QUIET_EARLY:
     # 屏蔽 [Taichi]/Warp 启动横幅、设备列表、部分 JIT 提示（多卡 runner 子进程）
     with open(os.devnull, "w") as _dn:
         with contextlib.redirect_stdout(_dn), contextlib.redirect_stderr(_dn):
-            wp.init()
-            wp.config.verify_cuda = True
-            ti.init(arch=ti.cuda, device_memory_GB=8.0)
+            _init_warp_taichi_backends()
 else:
-    wp.init()
-    wp.config.verify_cuda = True
-    ti.init(arch=ti.cuda, device_memory_GB=8.0)
+    _init_warp_taichi_backends()
+
+@wp.kernel
+def _warp_cuda_probe_kernel(x: wp.array(dtype=float)):
+    tid = wp.tid()
+    x[tid] = x[tid] + 0.0
+
+
+def _select_warp_device() -> str:
+    """尝试在 CUDA 上做一次最小 kernel launch；失败则降级 CPU。"""
+    try:
+        buf = wp.zeros(shape=1, dtype=float, device="cuda:0")
+        wp.launch(kernel=_warp_cuda_probe_kernel, dim=1, inputs=[buf], device="cuda:0")
+        return "cuda:0"
+    except Exception as e:
+        print(f"[modified_simulation] Warp CUDA probe failed ({e}); fallback to warp cpu.")
+        return "cpu"
+
+
+_WARP_DEVICE = _select_warp_device()
 
 
 class PipelineParamsNoparse:
@@ -789,6 +906,7 @@ if __name__ == "__main__":
         # fill particles if needed
         gs_num = transformed_pos.shape[0]
         device = "cuda:0"
+        warp_device = _WARP_DEVICE
         filling_params = preprocessing_params["particle_filling"]
 
         if filling_params is not None:
@@ -903,15 +1021,17 @@ if __name__ == "__main__":
             print("check *.ply files to see if it's ready for simulation")
 
         # set up the mpm solver
-        mpm_solver = MPM_Simulator_WARP(10)
+        mpm_solver = MPM_Simulator_WARP(10, device=warp_device)
+        _mpm_tensor_device = device if str(warp_device).startswith("cuda") else "cpu"
         mpm_solver.load_initial_data_from_torch(
-            mpm_init_pos,
-            mpm_init_vol,
-            mpm_init_cov,
+            mpm_init_pos.to(device=_mpm_tensor_device),
+            mpm_init_vol.to(device=_mpm_tensor_device),
+            mpm_init_cov.to(device=_mpm_tensor_device),
             n_grid=material_params["n_grid"],
             grid_lim=material_params["grid_lim"],
+            device=warp_device,
         )
-        mpm_solver.set_parameters_dict(material_params)
+        mpm_solver.set_parameters_dict(material_params, device=warp_device)
 
         # 基于仿真类型自动设置边界条件（当前支持 press/drop 自动推断）
         if args.sim_type == "press":
@@ -949,9 +1069,9 @@ if __name__ == "__main__":
             )
 
         # Note: boundary conditions may depend on mass, so the order cannot be changed!
-        set_boundary_conditions(mpm_solver, bc_params, time_params)
+        set_boundary_conditions(mpm_solver, bc_params, time_params, device=warp_device)
 
-        mpm_solver.finalize_mu_lam()
+        mpm_solver.finalize_mu_lam(device=warp_device)
 
         # 输出边界条件和力场信息（如果需要）
         force_overlay_info = None
@@ -1094,7 +1214,7 @@ if __name__ == "__main__":
         if eff_output_deformation or eff_output_stress_vol:
             if eff_output_stress_vol:
                 mpm_solver.recompute_particle_stress_from_F_trial(
-                    float(substep_dt), device=device
+                    float(substep_dt), device=warp_device
                 )
             save_fields_for_frame(
                 mpm_solver,
@@ -1332,7 +1452,7 @@ if __name__ == "__main__":
         for frame in _frame_bar:
 
             for step in range(step_per_frame):
-                mpm_solver.p2g2p(frame, substep_dt, device=device)
+                mpm_solver.p2g2p(frame, substep_dt, device=warp_device)
 
             # 循环中输出场（按间隔）
             if (eff_output_deformation or eff_output_stress_vol) and (
@@ -1340,7 +1460,7 @@ if __name__ == "__main__":
             ):
                 if eff_output_stress_vol:
                     mpm_solver.recompute_particle_stress_from_F_trial(
-                        float(substep_dt), device=device
+                        float(substep_dt), device=warp_device
                     )
                 save_fields_for_frame(
                     mpm_solver,
@@ -1368,12 +1488,12 @@ if __name__ == "__main__":
                 # 与 save_stress_field 一致的三维应力：g2p 已更新 F_trial，须先刷新 τ 再读
                 if want_stress_heatmap or want_stress_gaussian:
                     mpm_solver.recompute_particle_stress_from_F_trial(
-                        float(substep_dt), device=device
+                        float(substep_dt), device=warp_device
                     )
                 # 先导出当前粒子信息一次，供所有视角复用
                 pos_base = mpm_solver.export_particle_x_to_torch()[:gs_num].to(device)
-                cov3D_base = mpm_solver.export_particle_cov_to_torch()
-                rot_base = mpm_solver.export_particle_R_to_torch()
+                cov3D_base = mpm_solver.export_particle_cov_to_torch(device=warp_device)
+                rot_base = mpm_solver.export_particle_R_to_torch(device=warp_device)
                 cov3D_base = cov3D_base.view(-1, 6)[:gs_num].to(device)
                 rot_base = rot_base.view(-1, 3, 3)[:gs_num].to(device)
 

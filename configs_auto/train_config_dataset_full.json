@@ -5,7 +5,7 @@
   "_comment_seed": "主随机种子；影响每次 run 中 model / sim_type / 材质 的抽样顺序与结果。",
   "seed": 0,
   "_comment_num_simulations": "本配置要跑的仿真总次数（每个 job 独立随机一条）。",
-  "num_simulations": 500,
+  "num_simulations": 1000,
   "_comment_sim_types": "每次 job 的 sim_type 从此列表中均匀随机抽取。",
   "sim_types": ["bend", "drop", "press", "shear", "stretch"],
 

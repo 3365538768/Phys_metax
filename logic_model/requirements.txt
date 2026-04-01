@@ -1,0 +1,54 @@
+# logic_model 环境（与当前 MetaX / MACA 栈对齐的固定版本）
+#
+# 安装时请优先使用 MetaX 源（含 torch==...+metax 等构建）：
+#   pip install -r logic_model/requirements.txt \
+#     -i https://repos.metax-tech.com/r/maca-pypi/simple \
+#     --trusted-host repos.metax-tech.com
+#
+# setuptools：TensorBoard 仍依赖 pkg_resources；若 82.x 下缺失 pkg_resources，可固定为 69.5.1：
+#   pip install "setuptools==69.5.1"
+#
+# 若需 flash_attn 等未列入的包，请从同一索引查询可用版本后单独安装，例如：
+#   pip index versions flash_attn \
+#     -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
+#   pip install "flash_attn==<版本>" \
+#     -i https://repos.metax-tech.com/r/maca-pypi/simple --trusted-host repos.metax-tech.com
+
+absl-py==2.4.0
+contourpy==1.3.2
+cycler==0.12.1
+filelock==3.19.1
+fonttools==4.60.0
+fsspec==2025.9.0
+grpcio==1.80.0
+Jinja2==3.1.6
+kiwisolver==1.4.9
+lmdb==1.7.2
+Markdown==3.10.2
+MarkupSafe==3.0.3
+matplotlib==3.10.6
+mpmath==1.3.0
+networkx==3.4.2
+numpy==1.26.4
+packaging==26.0
+pillow==12.1.1
+protobuf==7.34.1
+pyparsing==3.2.5
+python-dateutil==2.9.0.post0
+setuptools==69.5.1
+six==1.17.0
+sympy==1.14.0
+tensorboard==2.20.0
+tensorboard-data-server==0.7.2
+torch==2.8.0+metax3.5.3.9
+tqdm==4.67.1
+typing_extensions==4.15.0
+Werkzeug==3.1.7
+opencv-python==4.9.0.80
+
+# 构建/工具链（可选；一般不必写入生产镜像，仅复现开发机时可保留）
+# pip==26.0.1
+# wheel==0.46.3
+
+# 可选：dataset 导出 PNG 预览
+# opencv-python-headless==4.11.0.86

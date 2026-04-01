@@ -12,8 +12,18 @@ class MPM_Simulator_WARP:
         self.initialize(n_particles, n_grid, grid_lim, device=device)
         self.time_profile = {}
 
+    def _resolve_device(self, device=None):
+        return self.device if device is None else device
+
+    def _warp_array_to_torch(self, arr):
+        """CPU 模式下避免 wp.to_torch 的 CUDA 指针路径，改走 numpy bridge。"""
+        if str(self.device).startswith("cpu"):
+            return torch.from_numpy(arr.numpy())
+        return wp.to_torch(arr)
+
     def initialize(self, n_particles, n_grid=100, grid_lim=1.0, device="cuda:0"):
         self.n_particles = n_particles
+        self.device = device
 
         self.mpm_model = MPMModelStruct()
         # domain will be [0,grid_lim]*[0,grid_lim]*[0,grid_lim] !!!
@@ -192,7 +202,7 @@ class MPM_Simulator_WARP:
 
 
         # cache initial particle positions for displacement field
-        self.initial_particle_x = wp.to_torch(self.mpm_state.particle_x).clone()
+        self.initial_particle_x = self._warp_array_to_torch(self.mpm_state.particle_x).clone()
 
         print("Particles initialized from sampling file.")
         print("Total particles: ", self.n_particles)
@@ -212,7 +222,7 @@ class MPM_Simulator_WARP:
         # assert tensor_x.shape[0] == tensor_cov.reshape(-1, 6).shape[0]
         self.initialize(self.n_particles, n_grid, grid_lim, device=device)
 
-        self.import_particle_x_from_torch(tensor_x, device)
+        self.import_particle_x_from_torch(tensor_x, device=device)
         self.mpm_state.particle_vol = wp.from_numpy(
             tensor_volume.detach().clone().cpu().numpy(), dtype=float, device=device
         )
@@ -245,14 +255,14 @@ class MPM_Simulator_WARP:
         # initial trial deformation gradient is set to identity
 
                 # cache initial particle positions for displacement field
-        self.initial_particle_x = wp.to_torch(self.mpm_state.particle_x).clone()
+        self.initial_particle_x = self._warp_array_to_torch(self.mpm_state.particle_x).clone()
 
         print("Particles initialized from torch data.")
         print("Total particles: ", self.n_particles)
 
     # must give density. mass will be updated as density * volume
     def set_parameters(self, device="cuda:0", **kwargs):
-        self.set_parameters_dict(device, kwargs)
+        self.set_parameters_dict(kwargs, device=device)
 
     def set_parameters_dict(self, kwargs={}, device="cuda:0"):
         if "material" in kwargs:
@@ -587,25 +597,25 @@ class MPM_Simulator_WARP:
             self.mpm_state.particle_C = torch2warp_mat33(tensor_C, dvc=device)
 
     def export_particle_x_to_torch(self):
-        return wp.to_torch(self.mpm_state.particle_x)
+        return self._warp_array_to_torch(self.mpm_state.particle_x)
 
     def export_particle_v_to_torch(self):
-        return wp.to_torch(self.mpm_state.particle_v)
+        return self._warp_array_to_torch(self.mpm_state.particle_v)
 
     def export_particle_F_to_torch(self):
-        F_tensor = wp.to_torch(self.mpm_state.particle_F)
+        F_tensor = self._warp_array_to_torch(self.mpm_state.particle_F)
         F_tensor = F_tensor.reshape(-1, 9)
         return F_tensor
 
 
     def export_particle_F_trial_to_torch(self):
         """Return F_trial as a torch tensor with shape (N, 3, 3)."""
-        F_trial = wp.to_torch(self.mpm_state.particle_F_trial)
+        F_trial = self._warp_array_to_torch(self.mpm_state.particle_F_trial)
         return F_trial
 
     def export_particle_stress_to_torch(self):
         """Return Kirchhoff stress τ as a torch tensor with shape (N, 3, 3)."""
-        tau = wp.to_torch(self.mpm_state.particle_stress)
+        tau = self._warp_array_to_torch(self.mpm_state.particle_stress)
         return tau
 
     def export_displacement_to_torch(self):
@@ -662,7 +672,7 @@ class MPM_Simulator_WARP:
 
         tau = self.export_particle_stress_to_torch()
         if use_F == "elastic":
-            F = wp.to_torch(self.mpm_state.particle_F)
+            F = self._warp_array_to_torch(self.mpm_state.particle_F)
         else:
             F = self.export_particle_F_trial_to_torch()
 
@@ -676,7 +686,8 @@ class MPM_Simulator_WARP:
 
         np.savez(os.path.join(save_dir, f"stress_frame_{frame_id:04d}.npz"), **out)
 
-    def export_particle_R_to_torch(self, device="cuda:0"):
+    def export_particle_R_to_torch(self, device=None):
+        device = self._resolve_device(device)
         with wp.ScopedTimer(
             "compute_R_from_F",
             synchronize=True,
@@ -690,16 +701,17 @@ class MPM_Simulator_WARP:
                 device=device,
             )
 
-        R_tensor = wp.to_torch(self.mpm_state.particle_R)
+        R_tensor = self._warp_array_to_torch(self.mpm_state.particle_R)
         R_tensor = R_tensor.reshape(-1, 9)
         return R_tensor
 
     def export_particle_C_to_torch(self):
-        C_tensor = wp.to_torch(self.mpm_state.particle_C)
+        C_tensor = self._warp_array_to_torch(self.mpm_state.particle_C)
         C_tensor = C_tensor.reshape(-1, 9)
         return C_tensor
 
-    def export_particle_cov_to_torch(self, device="cuda:0"):
+    def export_particle_cov_to_torch(self, device=None):
+        device = self._resolve_device(device)
         if not self.mpm_model.update_cov_with_F:
             with wp.ScopedTimer(
                 "compute_cov_from_F",
@@ -714,7 +726,7 @@ class MPM_Simulator_WARP:
                     device=device,
                 )
 
-        cov = wp.to_torch(self.mpm_state.particle_cov)
+        cov = self._warp_array_to_torch(self.mpm_state.particle_cov)
         return cov
 
     def print_time_profile(self):
@@ -1177,7 +1189,14 @@ class MPM_Simulator_WARP:
     # given normal direction, say [0,0,1]
     # gradually release grid velocities from start position to end position
     def release_particles_sequentially(
-        self, normal, start_position, end_position, num_layers, start_time, end_time
+        self,
+        normal,
+        start_position,
+        end_position,
+        num_layers,
+        start_time,
+        end_time,
+        device="cuda:0",
     ):
         num_layers = 50
         point = [0, 0, 0]
@@ -1201,6 +1220,7 @@ class MPM_Simulator_WARP:
                 velocity=[0, 0, 0],
                 start_time=start_time,
                 end_time=end_time_portion * (i + 1),
+                device=device,
             )
 
 

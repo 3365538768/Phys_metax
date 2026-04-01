@@ -5,7 +5,6 @@ sys.path.append("gaussian-splatting")
 import argparse
 import math
 import cv2
-import torchvision
 import torch
 import os
 import numpy as np

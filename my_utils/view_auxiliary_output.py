@@ -214,8 +214,10 @@ def stress_gaussian_precomp_colors_and_opacity(
 
     colormap_steps：阶梯档数，≥2。
     """
-    device = vm.device
-    dtype = vm.dtype
+    device = base_sh_rgb.device
+    dtype = base_sh_rgb.dtype
+    vm = vm.to(device=device, dtype=dtype)
+    base_opacity = base_opacity.to(device=device, dtype=dtype)
     gsn = max(1, int(gs_num))
     n_stairs = max(2, int(colormap_steps))
 

@@ -1,0 +1,7 @@
+{
+  "bend": 0,
+  "drop": 1,
+  "press": 2,
+  "shear": 3,
+  "stretch": 4
+}

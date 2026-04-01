@@ -1,17 +1,41 @@
 from __future__ import annotations
 
+"""
+单机多卡训练（DDP）示例：在 **Phys 仓库根目录** 执行，配置文件在 ``logic_model/configs/`` 下::
+
+    torchrun --nproc_per_node=8 -m logic_model.train --config logic_model/configs/logic_train_dataset_mask_1000.json
+
+单卡::
+
+    python -m logic_model.train --config logic_model/configs/logic_train_dataset_mask_1000.json
+
+若在 ``Phys/logic_model`` 目录下执行，可用 ``--config configs/logic_train_dataset_mask_1000.json``。
+
+**Eval 与多卡**：eval 仅计算 loss（总 loss 与各分项），不写图或视频。默认仅 **rank0** 跑 eval，其它 rank 在 ``dist.barrier()`` 等待；若设 ``train.eval_use_distributed_sampler: true``，则各卡分片前向后 ``all_reduce`` 聚合指标。
+
+**AMP**：在 **CUDA** 上默认启用 **fp16**（``torch.cuda.amp.autocast`` + ``GradScaler``）。关闭：CLI ``--no_amp`` 或 JSON ``"use_amp": false``。
+
+**DataLoader（CUDA）**：``pin_memory=True``、``.to(..., non_blocking=True)``；若 ``train.num_workers`` > 0 则 ``persistent_workers=True``，``prefetch_factor`` 见 ``train.prefetch_factor``（默认 2，且至少为 2）。
+"""
+
 import argparse
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
+from torch.cuda.amp import GradScaler, autocast
+import torch.distributed as dist
+from tqdm.auto import tqdm
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data import Subset
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 
 from logic_model.dataset import LmdbGtDataset, collate_lmdb_gt_batch
 from logic_model.losses import (
@@ -29,6 +53,21 @@ def _pick(d: Dict[str, Any], k: str, default: Any) -> Any:
     return default if v is None else v
 
 
+def _cli_or_pick_cfg(arg_val: Any, cfg: Dict[str, Any], key: str, fallback: Any) -> Any:
+    """
+    配置读取优先级（与仅用 argparse 默认值冲突时以本函数为准）：
+    1) 命令行显式传入（非 None）→ 用命令行
+    2) 否则若 ``cfg[key]`` 存在且非 None → 用配置
+    3) 否则 ``fallback``
+
+    说明：若 CLI 某项 ``default`` 为非 None 的常数，则无法区分「用户未传」与「用户传了默认值」；
+    因此对依赖 JSON 配置的项，CLI 默认改为 None，未传时才读 config。
+    """
+    if arg_val is not None:
+        return arg_val
+    return _pick(cfg, key, fallback)
+
+
 def _load_config(path: str | None) -> Dict[str, Any]:
     if not path:
         return {}
@@ -37,6 +76,51 @@ def _load_config(path: str | None) -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"config must be json object: {path}")
     return cfg
+
+
+def _resolve_path_relative_to_config(rel: str, config_path: str | None) -> Path:
+    """
+    相对路径解析顺序：
+    1) 相对 **配置文件所在目录**（如 ``logic_model/configs/*.json`` 旁的兄弟路径）；
+    2) 相对 **当前工作目录**（便于 ``data.split_root`` 写 ``auto_output/...`` 时在 Phys 根目录运行）。
+    """
+    p = Path(rel).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    if config_path:
+        cand = (Path(config_path).resolve().parent / p).resolve()
+        if cand.exists():
+            return cand
+    cwd_p = (Path.cwd() / p).resolve()
+    if cwd_p.exists():
+        return cwd_p
+    return cwd_p
+
+
+def _load_split_json(path: Path) -> Dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"split json 顶层必须是 object: {path}")
+    return raw
+
+
+def _init_distributed() -> Tuple[bool, int, int, int]:
+    """WORLD_SIZE>1 时初始化进程组，返回 (distributed, rank, local_rank, world_size)。"""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return False, 0, 0, 1
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed 不可用")
+    if not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    return True, rank, local_rank, world_size
+
+
+def _unwrap_model(m: torch.nn.Module) -> torch.nn.Module:
+    return m.module if isinstance(m, DDP) else m
 
 
 def _to_target_params(p: torch.Tensor) -> torch.Tensor:
@@ -109,88 +193,167 @@ def _object_mask_weighted_field_loss(
     return num / (den + 1e-6)
 
 
-def _tensor_video_to_u8_rgb_frames(
-    x_tc_hw: torch.Tensor,
+def _compute_eval_batch_losses(
+    model: torch.nn.Module,
+    ev_m: torch.nn.Module,
+    batch: Dict[str, Any],
+    device: torch.device,
+    loss_reg: Arch4RegressionLoss,
+    phys_cfg: PhysicsConsistencyConfig,
     *,
-    colormap: str = "turbo",
-    value_min: float = 0.0,
-    value_max: float = 1.0,
-) -> np.ndarray:
-    """
-    输入:
-    - [T,H,W]（单通道）: 归一化后 colormap 着色为 RGB
-    - [T,3,H,W]（RGB）: 按固定 value range 映射为 RGB（便于 pred/gt 同口径对比）
-    输出 uint8 [T,H,W,3]。
-    """
-    x = x_tc_hw.detach().float().cpu().numpy()
+    lambda_stress: float,
+    lambda_flow: float,
+    lambda_force: float,
+    lambda_action: float,
+    lambda_phys: float,
+    object_mask_fg_weight: float,
+    object_mask_bg_weight: float,
+    object_mask_bg_black: bool,
+    use_amp: bool = False,
+    non_blocking: bool = False,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """eval 前向一步，返回总 loss 与各分项（与训练时加权方式一致）。"""
+    rgb = batch["rgb"].to(device, non_blocking=non_blocking)
+    stress_gt = batch["stress"].to(device, non_blocking=non_blocking)
+    flow_gt = batch["flow"].to(device, non_blocking=non_blocking)
+    force_gt = batch["force_mask"].to(device, non_blocking=non_blocking)
+    object_gt = batch["object_mask"].to(device, non_blocking=non_blocking)
+    params_gt_raw = batch["params"].to(device, non_blocking=non_blocking)
+    action_label = batch["action_label"].to(device, non_blocking=non_blocking)
 
-    try:
-        import cv2
-    except ImportError as e:
-        raise RuntimeError("保存 eval 视频需要 opencv-python（cv2）") from e
+    if int(ev_m.in_channels) == 1:
+        x = rgb[:, :, :1, :, :, :]
+    else:
+        x = rgb[:, :, : int(ev_m.in_channels), :, :, :]
+    if int(x.shape[3]) != int(ev_m.num_frames):
+        x = _resample_time_bvcthw(x, int(ev_m.num_frames))
+        stress_gt = _resample_time_bvcthw(stress_gt, int(ev_m.num_frames))
+        flow_gt = _resample_time_bvcthw(flow_gt, int(ev_m.num_frames))
+        force_gt = _resample_time_bvcthw(force_gt, int(ev_m.num_frames))
+        object_gt = _resample_time_bvcthw(object_gt, int(ev_m.num_frames))
 
-    # 单通道: [T,H,W]
-    if x.ndim == 3:
-        x_min = float(np.min(x))
-        x_max = float(np.max(x))
-        if (x_max - x_min) < 1e-8:
-            gray = np.zeros_like(x, dtype=np.uint8)
-        else:
-            x01 = (x - x_min) / (x_max - x_min + 1e-8)
-            gray = np.clip(x01 * 255.0, 0, 255).astype(np.uint8)
+    _amp = autocast(dtype=torch.float16, enabled=bool(use_amp and device.type == "cuda"))
+    with _amp:
+        out = model(x)
+        gt_train_space = _to_target_params(params_gt_raw)
+        valid_mask = torch.ones_like(gt_train_space)
+        valid_mask[:, 3] = (params_gt_raw[:, 3] > 0).to(valid_mask.dtype)
 
-        cmap_key = str(colormap).strip().lower()
-        cmap_map = {
-            "turbo": cv2.COLORMAP_TURBO,
-            "jet": cv2.COLORMAP_JET,
-            "viridis": cv2.COLORMAP_VIRIDIS,
-            "magma": cv2.COLORMAP_MAGMA,
-            "inferno": cv2.COLORMAP_INFERNO,
-        }
-        cmap = cmap_map.get(cmap_key, cv2.COLORMAP_TURBO)
-        frames_rgb = []
-        for i in range(int(gray.shape[0])):
-            bgr = cv2.applyColorMap(gray[i], cmap)  # [H,W,3] BGR
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            frames_rgb.append(rgb)
-        return np.stack(frames_rgb, axis=0).astype(np.uint8)
+        loss_reg_part = loss_reg(out["param_pred"], gt_train_space, out["logvar"], valid_mask=valid_mask)
+        loss_stress_part = _object_mask_weighted_field_loss(
+            out["stress_field_pred"],
+            stress_gt,
+            object_gt,
+            fg_weight=object_mask_fg_weight,
+            bg_weight=object_mask_bg_weight,
+            bg_black=object_mask_bg_black,
+        )
+        loss_flow_part = _object_mask_weighted_field_loss(
+            out["flow_field_pred"],
+            flow_gt,
+            object_gt,
+            fg_weight=object_mask_fg_weight,
+            bg_weight=object_mask_bg_weight,
+            bg_black=object_mask_bg_black,
+        )
+        loss_force_part = _object_mask_weighted_field_loss(
+            out["force_pred"],
+            force_gt,
+            object_gt,
+            fg_weight=object_mask_fg_weight,
+            bg_weight=object_mask_bg_weight,
+            bg_black=object_mask_bg_black,
+        )
+        action_ret = action_classification_loss(out["action_logits"], action_label)
+        phys_ret = compute_physics_consistency_losses(
+            stress_pred=out["stress_field_pred"],
+            flow_pred=out["flow_field_pred"],
+            force_pred=out["force_pred"],
+            force_gt=force_gt,
+            cfg=phys_cfg,
+        )
+        loss_total = (
+            loss_reg_part
+            + lambda_stress * loss_stress_part
+            + lambda_flow * loss_flow_part
+            + lambda_force * loss_force_part
+            + lambda_action * action_ret["loss_action"]
+            + lambda_phys * phys_ret["loss_phys_total"]
+        )
+    parts = {
+        "loss_reg": loss_reg_part,
+        "loss_stress": loss_stress_part,
+        "loss_flow": loss_flow_part,
+        "loss_force": loss_force_part,
+        "loss_action": action_ret["loss_action"],
+        "loss_phys_total": phys_ret["loss_phys_total"],
+        "loss_phys_sf": phys_ret["loss_stress_flow_consistency"],
+        "loss_phys_fs": phys_ret["loss_force_stress_consistency"],
+        "loss_phys_ff": phys_ret["loss_force_flow_consistency"],
+        "action_acc": action_ret["action_acc"],
+    }
+    return loss_total, parts
 
-    # RGB: [T,3,H,W]
-    if x.ndim == 4 and int(x.shape[1]) == 3:
-        vmin = float(value_min)
-        vmax = float(value_max)
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
-        x01 = (x - vmin) / (vmax - vmin)
-        x01 = np.clip(x01, 0.0, 1.0)
-        return np.transpose((x01 * 255.0).astype(np.uint8), (0, 2, 3, 1))
 
-    raise ValueError(f"expect [T,H,W] or [T,3,H,W], got {x.shape}")
+def _eval_sums_to_record(
+    sums: List[float],
+    *,
+    lambda_stress: float,
+    lambda_flow: float,
+    lambda_force: float,
+    lambda_action: float,
+    lambda_phys: float,
+) -> Dict[str, Any]:
+    """将 eval 累积向量转为 JSON/日志用 dict；sums[0..10] 为加权和，sums[11]=样本数。"""
+    n = max(float(sums[11]), 1.0)
+
+    def a(i: int) -> float:
+        return float(sums[i]) / n
+
+    return {
+        "avg_loss": a(0),
+        "avg_loss_reg": a(1),
+        "avg_loss_stress": a(2),
+        "avg_loss_flow": a(3),
+        "avg_loss_force": a(4),
+        "avg_loss_action": a(5),
+        "avg_loss_phys_total": a(6),
+        "avg_loss_phys_sf": a(7),
+        "avg_loss_phys_fs": a(8),
+        "avg_loss_phys_ff": a(9),
+        "avg_action_acc": a(10),
+        "weighted_reg": a(1),
+        "weighted_stress": float(lambda_stress) * a(2),
+        "weighted_flow": float(lambda_flow) * a(3),
+        "weighted_force": float(lambda_force) * a(4),
+        "weighted_action": float(lambda_action) * a(5),
+        "weighted_phys": float(lambda_phys) * a(6),
+        "num_samples": int(round(n)),
+    }
 
 
-def _save_rgb_video_mp4(frames_u8_thwc: np.ndarray, out_path: Path, fps: int = 12) -> None:
-    """
-    保存 RGB 帧 [T,H,W,3] 到 mp4。
-    """
-    try:
-        import cv2
-    except ImportError as e:
-        raise RuntimeError("保存 eval 视频需要 opencv-python（cv2）") from e
-
-    t, h, w, c = map(int, frames_u8_thwc.shape)
-    if c != 3:
-        raise ValueError(f"expect RGB frames [T,H,W,3], got {frames_u8_thwc.shape}")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (w, h))
-    if not vw.isOpened():
-        raise RuntimeError(f"无法写入视频: {out_path}")
-    try:
-        for i in range(t):
-            rgb = frames_u8_thwc[i]
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            vw.write(bgr)
-    finally:
-        vw.release()
+def _tensorboard_log_eval_metrics(tb: SummaryWriter, m: Dict[str, Any], epoch_1based: int) -> None:
+    for key in (
+        "avg_loss",
+        "avg_loss_reg",
+        "avg_loss_stress",
+        "avg_loss_flow",
+        "avg_loss_force",
+        "avg_loss_action",
+        "avg_loss_phys_total",
+        "avg_loss_phys_sf",
+        "avg_loss_phys_fs",
+        "avg_loss_phys_ff",
+        "avg_action_acc",
+        "weighted_reg",
+        "weighted_stress",
+        "weighted_flow",
+        "weighted_force",
+        "weighted_action",
+        "weighted_phys",
+    ):
+        if key in m:
+            tb.add_scalar(f"eval/{key}", float(m[key]), epoch_1based)
 
 
 def _auto_pick_least_utilized_gpu() -> int | None:
@@ -278,40 +441,86 @@ def _auto_pick_least_utilized_gpu() -> int | None:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser("logic_model minimal trainer")
     ap.add_argument("--config", type=str, default=None)
-    ap.add_argument("--split_root", type=str, default="auto_output/dataset_deformation_stress_500_new/train")
-    ap.add_argument("--epochs", type=int, default=1000)
-    ap.add_argument("--batch_size", type=int, default=1)
-    ap.add_argument("--max_samples", type=int, default=1, help=">0 时仅取前 N 个样本做快速调试")
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--num_workers", type=int, default=0)
-    ap.add_argument("--max_views", type=int, default=3)
-    ap.add_argument("--num_frames", type=int, default=0, help="0=按LMDB实际总帧数")
-    ap.add_argument("--img_size", type=int, default=0, help="仅 num_frames>0 时需要")
-    ap.add_argument("--dec_h", type=int, default=112)
-    ap.add_argument("--dec_w", type=int, default=112)
-    ap.add_argument("--device", type=str, default="cuda")
-    # loss weights
-    ap.add_argument("--lambda_stress", type=float, default=10)
-    ap.add_argument("--lambda_flow", type=float, default=10)
-    ap.add_argument("--lambda_force", type=float, default=10)
-    ap.add_argument("--lambda_action", type=float, default=1.0)
-    ap.add_argument("--lambda_phys", type=float, default=0.001)
-    ap.add_argument("--use_pred_force_mask_for_phys", action="store_true")
-    ap.add_argument("--save_every_epochs", type=int, default=100000)
-    ap.add_argument("--eval_every_epochs", type=int, default=100)
-    ap.add_argument("--eval_batches", type=int, default=1, help="每次 eval 评估多少个 batch（最小调试用）")
-    ap.add_argument("--eval_video_fps", type=int, default=16)
-    ap.add_argument("--eval_max_video_views", type=int, default=2)
-    ap.add_argument("--eval_video_value_min", type=float, default=0.0, help="RGB 导出固定映射下界")
-    ap.add_argument("--eval_video_value_max", type=float, default=1.0, help="RGB 导出固定映射上界")
-    ap.add_argument("--object_mask_fg_weight", type=float, default=10.0, help="object_mask 前景损失权重")
-    ap.add_argument("--object_mask_bg_weight", type=float, default=1.0, help="object_mask 背景损失权重")
-    ap.add_argument("--object_mask_bg_black", type=int, default=1, help="1=背景监督为黑色(0), 0=背景也拟合gt")
     ap.add_argument(
-        "--eval_video_colormap",
+        "--split_root",
         type=str,
-        default="turbo",
-        help="stress/flow/force 单通道预测转 RGB 时使用的 colormap: turbo/jet/viridis/magma/inferno",
+        default=None,
+        help="数据根目录；缺省时用 config 的 data.split_root",
+    )
+    ap.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="未传时读 train.epochs；仍缺省则为 1000",
+    )
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="未传时读 train.batch_size；仍缺省则为 1",
+    )
+    ap.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="未传时读 train.max_samples；>0 仅前 N 个样本；0=全部",
+    )
+    ap.add_argument("--lr", type=float, default=None, help="未传时读 train.lr；缺省 3e-4")
+    ap.add_argument("--num_workers", type=int, default=None, help="未传时读 train.num_workers；缺省 0")
+    ap.add_argument("--max_views", type=int, default=None, help="未传时读 model.num_views；缺省 4")
+    ap.add_argument(
+        "--num_frames",
+        type=int,
+        default=None,
+        help="未传时读 model.num_frames；0=按 LMDB；CLI 缺省视为未传",
+    )
+    ap.add_argument("--img_size", type=int, default=None, help="未传时读 model.img_size")
+    ap.add_argument("--dec_h", type=int, default=None, help="未传时读 model.dec_h；缺省 112")
+    ap.add_argument("--dec_w", type=int, default=None, help="未传时读 model.dec_w；缺省 112")
+    ap.add_argument("--device", type=str, default=None, help="未传时读 train.device；缺省 cuda")
+    ap.add_argument(
+        "--output_root",
+        type=str,
+        default=None,
+        help="覆盖 train.output_root（如多副本并行时按副本区分目录）；未传时读 JSON",
+    )
+    # loss weights（未传时读 train.*；显式 CLI 覆盖 JSON）
+    ap.add_argument("--lambda_stress", type=float, default=None)
+    ap.add_argument("--lambda_flow", type=float, default=None)
+    ap.add_argument("--lambda_force", type=float, default=None)
+    ap.add_argument("--lambda_action", type=float, default=None)
+    ap.add_argument("--lambda_phys", type=float, default=None)
+    ap.add_argument("--use_pred_force_mask_for_phys", action="store_true")
+    ap.add_argument(
+        "--save_every_epochs",
+        type=int,
+        default=None,
+        help="覆盖 JSON：仅建议写 train.checkpoint.save_every_epochs；未传 CLI 时只读 checkpoint.save_every_epochs，再缺省 100000",
+    )
+    ap.add_argument(
+        "--eval_every_epochs",
+        type=int,
+        default=None,
+        help="未传时读 train.eval_every_epochs；缺省 100；旧配置仅设 quick_eval.every_epochs 时仍兼容并告警",
+    )
+    ap.add_argument(
+        "--eval_batches",
+        type=int,
+        default=None,
+        help="未传时读 train.eval_max_batches；0=跑满 eval_loader；CLI 缺省同未传",
+    )
+    ap.add_argument("--object_mask_fg_weight", type=float, default=None, help="未传时读 train.object_mask_fg_weight")
+    ap.add_argument("--object_mask_bg_weight", type=float, default=None, help="未传时读 train.object_mask_bg_weight")
+    ap.add_argument("--object_mask_bg_black", type=int, default=None, help="未传时读 train.object_mask_bg_black")
+    ap.add_argument(
+        "--ddp",
+        action="store_true",
+        help="显式要求 DDP（需 torchrun WORLD_SIZE>1；一般可不写，自动检测）",
+    )
+    ap.add_argument(
+        "--no_amp",
+        action="store_true",
+        help="关闭 CUDA AMP（默认训练在 GPU 上使用 fp16 autocast + GradScaler）",
     )
     return ap.parse_args()
 
@@ -323,45 +532,164 @@ def main() -> None:
     cfg_model = cfg.get("model") or {}
     cfg_train = cfg.get("train") or {}
 
-    split_root = str(args.split_root if args.split_root is not None else _pick(cfg_data, "split_root", ""))
-    max_views = int(args.max_views if args.max_views is not None else _pick(cfg_model, "num_views", 4))
-    num_frames = int(args.num_frames if args.num_frames is not None else _pick(cfg_model, "num_frames", 0))
-    img_size = int(args.img_size if args.img_size is not None else _pick(cfg_model, "img_size", 0))
-    dec_h = int(args.dec_h if args.dec_h is not None else _pick(cfg_model, "dec_h", 56))
-    dec_w = int(args.dec_w if args.dec_w is not None else _pick(cfg_model, "dec_w", 56))
+    split_root = (args.split_root or "").strip() or str(_pick(cfg_data, "split_root", "") or "").strip()
+    if not split_root:
+        split_root = "auto_output/dataset_deformation_stress_500_new/train"
+    split_root = str(Path(split_root).expanduser())
+
+    max_views = int(_cli_or_pick_cfg(args.max_views, cfg_model, "num_views", 4))
+    num_frames = int(_cli_or_pick_cfg(args.num_frames, cfg_model, "num_frames", 0))
+    img_size = int(_cli_or_pick_cfg(args.img_size, cfg_model, "img_size", 0))
+    dec_h = int(_cli_or_pick_cfg(args.dec_h, cfg_model, "dec_h", 112))
+    dec_w = int(_cli_or_pick_cfg(args.dec_w, cfg_model, "dec_w", 112))
+
+    lmdb_env_subdir = str(
+        _pick(cfg_data, "lmdb_env_subdir", "arch4_data.lmdb") or "arch4_data.lmdb"
+    ).strip() or "arch4_data.lmdb"
+
+    train_ids_json = cfg_data.get("train_ids_json") or cfg_train.get("train_ids_json")
+    train_id_list: Optional[List[str]] = None
+    test_id_list: Optional[List[str]] = None
+    split_meta: Dict[str, Any] = {}
+    if train_ids_json:
+        jp = _resolve_path_relative_to_config(str(train_ids_json), args.config)
+        if not jp.is_file():
+            raise FileNotFoundError(f"train_ids_json 不存在: {jp}")
+        split_meta = _load_split_json(jp)
+        train_id_list = [str(x) for x in (split_meta.get("train_ids") or [])]
+        test_id_list = [str(x) for x in (split_meta.get("test_ids") or [])]
+        sr_json = str(split_meta.get("split_root") or "").strip()
+        if sr_json and not (args.split_root or "").strip() and not cfg_data.get("split_root"):
+            split_root = sr_json
+        lm = split_meta.get("lmdb_env_subdir")
+        if lm and not cfg_data.get("lmdb_env_subdir"):
+            lmdb_env_subdir = str(lm).strip() or lmdb_env_subdir
+
+    if args.max_samples is not None:
+        max_samples = int(args.max_samples)
+    elif cfg_train.get("max_samples") is not None:
+        max_samples = int(cfg_train["max_samples"])
+    elif bool(cfg_train.get("debug_overfit")) and cfg_train.get("overfit_num_samples") is not None:
+        max_samples = int(cfg_train["overfit_num_samples"])
+    else:
+        max_samples = 0
 
     ds = LmdbGtDataset(
         split_root=split_root,
+        lmdb_env_subdir=lmdb_env_subdir,
         max_views=max_views,
         num_frames=(None if num_frames <= 0 else num_frames),
         img_size=(None if img_size <= 0 else img_size),
         return_action_name=True,
+        sample_ids=train_id_list,
     )
-    train_source = Subset(ds, list(range(min(int(args.max_samples), len(ds))))) if int(args.max_samples) > 0 else ds
+    train_source = (
+        Subset(ds, list(range(min(int(max_samples), len(ds)))))
+        if int(max_samples) > 0
+        else ds
+    )
+    shuffle_train = not bool(cfg_train.get("overfit_no_shuffle", False))
+    bs = int(_cli_or_pick_cfg(args.batch_size, cfg_train, "batch_size", 1))
+    nw = int(_cli_or_pick_cfg(args.num_workers, cfg_train, "num_workers", 0))
+
+    distributed, rank, local_rank, world_size = _init_distributed()
+    if bool(getattr(args, "ddp", False)) and not distributed:
+        raise ValueError("--ddp 已指定但未检测到 WORLD_SIZE>1，请使用 torchrun 启动")
+
+    train_sampler: Optional[DistributedSampler] = None
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_source,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle_train,
+        )
+
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP 训练需要 CUDA")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device_str = str(_cli_or_pick_cfg(args.device, cfg_train, "device", "cuda"))
+        if device_str.startswith("cuda") and not torch.cuda.is_available():
+            device_str = "cpu"
+        elif device_str in ("cuda", "auto"):
+            picked_gpu = _auto_pick_least_utilized_gpu()
+            if picked_gpu is None:
+                picked_gpu = 0
+            device_str = f"cuda:{picked_gpu}"
+        device = torch.device(device_str)
+
+    pin_memory = device.type == "cuda"
+    nb = pin_memory
+    prefetch_factor = max(2, int(_pick(cfg_train, "prefetch_factor", 2)))
+    _dl_extras: Dict[str, Any] = {}
+    if nw > 0:
+        _dl_extras["persistent_workers"] = True
+        _dl_extras["prefetch_factor"] = prefetch_factor
+
     loader = DataLoader(
         train_source,
-        batch_size=int(args.batch_size if args.batch_size is not None else _pick(cfg_train, "batch_size", 1)),
-        shuffle=True,
-        num_workers=int(args.num_workers if args.num_workers is not None else _pick(cfg_train, "num_workers", 0)),
+        batch_size=bs,
+        shuffle=(shuffle_train and not distributed),
+        sampler=train_sampler,
+        num_workers=nw,
         collate_fn=collate_lmdb_gt_batch,
-    )
-    eval_loader = DataLoader(
-        train_source,
-        batch_size=int(args.batch_size if args.batch_size is not None else _pick(cfg_train, "batch_size", 1)),
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_lmdb_gt_batch,
+        drop_last=False,
+        pin_memory=pin_memory,
+        **_dl_extras,
     )
 
-    device_str = str(args.device if args.device is not None else _pick(cfg_train, "device", "cuda"))
-    if device_str.startswith("cuda") and not torch.cuda.is_available():
-        device_str = "cpu"
-    elif device_str in ("cuda", "auto"):
-        picked_gpu = _auto_pick_least_utilized_gpu()
-        if picked_gpu is None:
-            picked_gpu = 0
-        device_str = f"cuda:{picked_gpu}"
-    device = torch.device(device_str)
+    eval_split = str(_pick(cfg_train, "eval_split", "train")).strip().lower()
+    if eval_split == "test":
+        if not test_id_list:
+            if rank == 0:
+                print(
+                    "[logic_train] WARN eval_split=test 但 split json 无 test_ids，"
+                    "回退为 eval_split=train"
+                )
+            eval_split = "train"
+    eval_use_distributed_sampler = bool(_pick(cfg_train, "eval_use_distributed_sampler", False))
+    eval_sharded = eval_use_distributed_sampler and distributed
+    eval_ds = train_source
+    if eval_split == "test" and test_id_list:
+        ds_eval = LmdbGtDataset(
+            split_root=split_root,
+            lmdb_env_subdir=lmdb_env_subdir,
+            max_views=max_views,
+            num_frames=(None if num_frames <= 0 else num_frames),
+            img_size=(None if img_size <= 0 else img_size),
+            return_action_name=True,
+            sample_ids=test_id_list,
+            action_to_id=ds.action_to_id,
+        )
+        eval_ds = ds_eval
+    eval_sampler_eval: Optional[DistributedSampler] = None
+    if eval_sharded:
+        eval_sampler_eval = DistributedSampler(
+            eval_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+        )
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=bs,
+        shuffle=False,
+        sampler=eval_sampler_eval,
+        num_workers=nw,
+        collate_fn=collate_lmdb_gt_batch,
+        pin_memory=pin_memory,
+        **_dl_extras,
+    )
+
+    if bool(getattr(args, "no_amp", False)):
+        use_amp = False
+    elif device.type != "cuda":
+        use_amp = False
+    else:
+        use_amp = bool(_pick(cfg_train, "use_amp", True))
 
     if num_frames > 0:
         model_num_frames = int(num_frames)
@@ -390,10 +718,18 @@ def main() -> None:
         use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
         bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
     ).to(device)
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
     opt = torch.optim.AdamW(
         model.parameters(),
-        lr=float(args.lr if args.lr is not None else _pick(cfg_train, "lr", 3e-4)),
+        lr=float(_cli_or_pick_cfg(args.lr, cfg_train, "lr", 3e-4)),
     )
+    scaler = GradScaler(enabled=use_amp)
 
     loss_reg = Arch4RegressionLoss(Arch4LossConfig())
     phys_cfg = PhysicsConsistencyConfig(
@@ -404,198 +740,358 @@ def main() -> None:
         use_pred_force_mask=bool(_pick(cfg_train, "use_pred_force_mask_for_phys", args.use_pred_force_mask_for_phys)),
     )
 
-    lambda_stress = float(_pick(cfg_train, "lambda_stress", args.lambda_stress))
-    lambda_flow = float(_pick(cfg_train, "lambda_flow", args.lambda_flow))
-    lambda_force = float(_pick(cfg_train, "lambda_force", args.lambda_force))
-    lambda_action = float(_pick(cfg_train, "lambda_action", args.lambda_action))
-    lambda_phys = float(_pick(cfg_train, "lambda_phys", args.lambda_phys))
-    object_mask_fg_weight = float(_pick(cfg_train, "object_mask_fg_weight", args.object_mask_fg_weight))
-    object_mask_bg_weight = float(_pick(cfg_train, "object_mask_bg_weight", args.object_mask_bg_weight))
-    object_mask_bg_black = bool(int(_pick(cfg_train, "object_mask_bg_black", args.object_mask_bg_black)))
+    lambda_stress = float(_cli_or_pick_cfg(args.lambda_stress, cfg_train, "lambda_stress", 10.0))
+    lambda_flow = float(_cli_or_pick_cfg(args.lambda_flow, cfg_train, "lambda_flow", 10.0))
+    lambda_force = float(_cli_or_pick_cfg(args.lambda_force, cfg_train, "lambda_force", 10.0))
+    lambda_action = float(_cli_or_pick_cfg(args.lambda_action, cfg_train, "lambda_action", 1.0))
+    lambda_phys = float(_cli_or_pick_cfg(args.lambda_phys, cfg_train, "lambda_phys", 0.001))
+    object_mask_fg_weight = float(_cli_or_pick_cfg(args.object_mask_fg_weight, cfg_train, "object_mask_fg_weight", 10.0))
+    object_mask_bg_weight = float(_cli_or_pick_cfg(args.object_mask_bg_weight, cfg_train, "object_mask_bg_weight", 1.0))
+    object_mask_bg_black = bool(
+        int(_cli_or_pick_cfg(args.object_mask_bg_black, cfg_train, "object_mask_bg_black", 1))
+    )
 
-    # 统一输出目录：全部保存在 logic_model 下
-    output_root = (Path("logic_model") / "output").resolve()
+    train_out_cli = str(args.output_root or "").strip()
+    if train_out_cli:
+        train_out = train_out_cli
+    else:
+        train_out = str(_pick(cfg_train, "output_root", "") or "").strip()
+    if train_out:
+        output_root = Path(train_out).expanduser().resolve()
+    else:
+        output_root = (Path("logic_model") / "output").resolve()
     ckpt_dir = output_root / "checkpoints"
     eval_dir = output_root / "eval"
+    tensorboard_dir = output_root / "tensorboard"
     output_root.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    tb_writer: Optional[SummaryWriter] = None
+    if rank == 0:
+        tb_writer = SummaryWriter(log_dir=str(tensorboard_dir))
 
-    save_every_epochs = max(1, int(args.save_every_epochs))
-    eval_every_epochs = max(1, int(args.eval_every_epochs))
-    eval_batches = max(1, int(args.eval_batches))
-    eval_video_fps = max(1, int(args.eval_video_fps))
-    eval_max_video_views = max(1, int(args.eval_max_video_views))
-    eval_video_value_min = float(args.eval_video_value_min)
-    eval_video_value_max = float(args.eval_video_value_max)
-    if eval_video_value_max <= eval_video_value_min:
-        eval_video_value_max = eval_video_value_min + 1e-6
-    eval_video_colormap = str(args.eval_video_colormap)
+    ckpt_cfg = cfg_train.get("checkpoint")
+    if not isinstance(ckpt_cfg, dict):
+        ckpt_cfg = {}
+    if args.save_every_epochs is not None:
+        save_every_epochs = max(1, int(args.save_every_epochs))
+    else:
+        sv_e = ckpt_cfg.get("save_every_epochs")
+        if sv_e is not None:
+            save_every_epochs = max(1, int(sv_e))
+        else:
+            save_every_epochs = max(1, int(100000))
 
-    epochs = int(args.epochs if args.epochs is not None else _pick(cfg_train, "epochs", 1))
-    print(
-        f"[logic_train] dataset={len(ds)} num_actions={ds.num_actions} "
-        f"lambdas(reg=1, stress={lambda_stress}, flow={lambda_flow}, force={lambda_force}, "
-        f"action={lambda_action}, phys={lambda_phys})"
-    )
-    print(
-        "[logic_train] "
-        f"object_mask_loss(fg_w={object_mask_fg_weight}, bg_w={object_mask_bg_weight}, "
-        f"bg_black={int(object_mask_bg_black)})"
-    )
-    print(f"[logic_train] action_to_id={json.dumps(ds.action_to_id, ensure_ascii=False)}")
-    print(f"[logic_train] model_num_frames={model.num_frames}")
-    print(f"[logic_train] device={device}")
-    print(f"[logic_train] output_root={output_root}")
+    ev_e = cfg_train.get("eval_every_epochs")
+    _eval_from_quick_eval = False
+    if ev_e is None:
+        qe = cfg_train.get("quick_eval")
+        if isinstance(qe, dict) and qe.get("every_epochs") is not None:
+            ev_e = qe["every_epochs"]
+            _eval_from_quick_eval = True
+    if args.eval_every_epochs is not None:
+        eval_every_epochs = max(1, int(args.eval_every_epochs))
+    else:
+        eval_every_epochs = max(1, int(ev_e if ev_e is not None else 100))
+    if rank == 0 and _eval_from_quick_eval:
+        print(
+            "[logic_train] WARN train.quick_eval.every_epochs 已废弃，请改用 train.eval_every_epochs",
+            flush=True,
+        )
+    if args.eval_batches is not None:
+        _eb = int(args.eval_batches)
+        eval_max_batches = len(eval_loader) if _eb <= 0 else max(1, _eb)
+    elif cfg_train.get("eval_max_batches") is not None:
+        _emi = int(cfg_train["eval_max_batches"])
+        eval_max_batches = len(eval_loader) if _emi <= 0 else max(1, _emi)
+    else:
+        eval_max_batches = len(eval_loader)
+    epochs = int(_cli_or_pick_cfg(args.epochs, cfg_train, "epochs", 1000))
+    if rank == 0:
+        print(
+            f"[logic_train] dataset_train={len(ds)} loader_samples={len(train_source)} "
+            f"num_actions={ds.num_actions} eval_split={eval_split} "
+            f"ddp={distributed} world_size={world_size} "
+            f"lambdas(reg=1, stress={lambda_stress}, flow={lambda_flow}, force={lambda_force}, "
+            f"action={lambda_action}, phys={lambda_phys})"
+        )
+        print(
+            "[logic_train] "
+            f"object_mask_loss(fg_w={object_mask_fg_weight}, bg_w={object_mask_bg_weight}, "
+            f"bg_black={int(object_mask_bg_black)})"
+        )
+        print(f"[logic_train] action_to_id={json.dumps(ds.action_to_id, ensure_ascii=False)}")
+        print(f"[logic_train] model_num_frames={_unwrap_model(model).num_frames}")
+        print(f"[logic_train] device={device}")
+        print(f"[logic_train] amp_fp16={use_amp}")
+        print(
+            f"[logic_train] dataloader: num_workers={nw} pin_memory={pin_memory} "
+            f"persistent_workers={nw > 0} prefetch_factor={prefetch_factor if nw > 0 else 'n/a'}"
+        )
+        print(f"[logic_train] output_root={output_root}")
+        print(f"[logic_train] tensorboard_dir={tensorboard_dir}")
+        print(
+            f"[logic_train] eval: every {eval_every_epochs} epoch(s), "
+            f"max_batches={eval_max_batches}, eval_sharded={eval_sharded}"
+        )
 
-    (output_root / "action_to_id.json").write_text(
-        json.dumps(ds.action_to_id, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    (output_root / "run_config.json").write_text(
-        json.dumps(
-            {
-                "args": vars(args),
-                "cfg_data": cfg_data,
-                "cfg_model": cfg_model,
-                "cfg_train": cfg_train,
-                "resolved": {
-                    "split_root": split_root,
-                    "max_views": max_views,
-                    "num_frames": num_frames,
-                    "img_size": img_size,
-                    "dec_h": dec_h,
-                    "dec_w": dec_w,
-                    "device": str(device),
-                    "model_num_frames": int(model.num_frames),
-                    "output_root": str(output_root),
+    if rank == 0:
+        (output_root / "action_to_id.json").write_text(
+            json.dumps(ds.action_to_id, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (output_root / "run_config.json").write_text(
+            json.dumps(
+                {
+                    "args": vars(args),
+                    "cfg_data": cfg_data,
+                    "cfg_model": cfg_model,
+                    "cfg_train": cfg_train,
+                    "resolved": {
+                        "distributed": distributed,
+                        "world_size": world_size,
+                        "rank": rank,
+                        "split_root": split_root,
+                        "lmdb_env_subdir": lmdb_env_subdir,
+                        "train_ids_json": str(train_ids_json or ""),
+                        "n_train_ids": len(train_id_list or []),
+                        "n_test_ids": len(test_id_list or []),
+                        "max_samples": int(max_samples),
+                        "eval_split": eval_split,
+                        "max_views": max_views,
+                        "num_frames": num_frames,
+                        "img_size": img_size,
+                        "dec_h": dec_h,
+                        "dec_w": dec_w,
+                        "device": str(device),
+                        "use_amp_fp16": bool(use_amp),
+                        "dataloader_num_workers": int(nw),
+                        "dataloader_pin_memory": bool(pin_memory),
+                        "dataloader_persistent_workers": bool(nw > 0),
+                        "dataloader_prefetch_factor": int(prefetch_factor) if nw > 0 else None,
+                        "model_num_frames": int(_unwrap_model(model).num_frames),
+                        "output_root": str(output_root),
+                        "tensorboard_dir": str(tensorboard_dir),
+                        "epochs": int(epochs),
+                        "save_every_epochs": int(save_every_epochs),
+                        "eval_every_epochs": int(eval_every_epochs),
+                        "eval_max_batches": int(eval_max_batches),
+                        "eval_sharded": bool(eval_sharded),
+                        "lambda_stress": float(lambda_stress),
+                        "lambda_flow": float(lambda_flow),
+                        "lambda_force": float(lambda_force),
+                        "lambda_action": float(lambda_action),
+                        "lambda_phys": float(lambda_phys),
+                    },
                 },
-            },
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
-    for epoch in range(epochs):
+    epoch_pbar = tqdm(
+        range(epochs),
+        desc="epoch",
+        disable=rank != 0,
+        dynamic_ncols=True,
+        leave=True,
+    )
+    for epoch in epoch_pbar:
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
-        total = 0.0
-        n = 0
-        for bi, batch in enumerate(loader):
-            rgb = batch["rgb"].to(device)
-            stress_gt = batch["stress"].to(device)
-            flow_gt = batch["flow"].to(device)
-            force_gt = batch["force_mask"].to(device)
-            object_gt = batch["object_mask"].to(device)
-            params_gt_raw = batch["params"].to(device)
-            action_label = batch["action_label"].to(device)
+        mcore = _unwrap_model(model)
+        train_sums = [0.0] * 12
+        train_pbar = tqdm(
+            loader,
+            desc=f"train {epoch + 1}/{epochs}",
+            disable=rank != 0,
+            total=len(loader),
+            leave=False,
+            dynamic_ncols=True,
+        )
+        last_end = time.perf_counter()
+        for bi, batch in enumerate(train_pbar):
+            t0 = time.perf_counter()
+            data_time = t0 - last_end
+
+            rgb = batch["rgb"].to(device, non_blocking=nb)
+            stress_gt = batch["stress"].to(device, non_blocking=nb)
+            flow_gt = batch["flow"].to(device, non_blocking=nb)
+            force_gt = batch["force_mask"].to(device, non_blocking=nb)
+            object_gt = batch["object_mask"].to(device, non_blocking=nb)
+            params_gt_raw = batch["params"].to(device, non_blocking=nb)
+            action_label = batch["action_label"].to(device, non_blocking=nb)
 
             # [B,V,3,T,H,W] -> [B,V,C,T,H,W]，兼容 in_channels
-            if int(model.in_channels) == 1:
+            if int(mcore.in_channels) == 1:
                 x = rgb[:, :, :1, :, :, :]
             else:
-                x = rgb[:, :, : int(model.in_channels), :, :, :]
+                x = rgb[:, :, : int(mcore.in_channels), :, :, :]
 
             # 兼容 full-frames 数据读取：训练时对齐到模型固定 num_frames
-            if int(x.shape[3]) != int(model.num_frames):
-                x = _resample_time_bvcthw(x, int(model.num_frames))
-                stress_gt = _resample_time_bvcthw(stress_gt, int(model.num_frames))
-                flow_gt = _resample_time_bvcthw(flow_gt, int(model.num_frames))
-                force_gt = _resample_time_bvcthw(force_gt, int(model.num_frames))
-                object_gt = _resample_time_bvcthw(object_gt, int(model.num_frames))
+            if int(x.shape[3]) != int(mcore.num_frames):
+                x = _resample_time_bvcthw(x, int(mcore.num_frames))
+                stress_gt = _resample_time_bvcthw(stress_gt, int(mcore.num_frames))
+                flow_gt = _resample_time_bvcthw(flow_gt, int(mcore.num_frames))
+                force_gt = _resample_time_bvcthw(force_gt, int(mcore.num_frames))
+                object_gt = _resample_time_bvcthw(object_gt, int(mcore.num_frames))
 
-            out = model(x)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
 
-            gt_train_space = _to_target_params(params_gt_raw)
-            valid_mask = torch.ones_like(gt_train_space)
-            valid_mask[:, 3] = (params_gt_raw[:, 3] > 0).to(valid_mask.dtype)
+            with autocast(dtype=torch.float16, enabled=use_amp):
+                out = model(x)
 
-            loss_reg_part = loss_reg(out["param_pred"], gt_train_space, out["logvar"], valid_mask=valid_mask)
-            loss_stress_part = _object_mask_weighted_field_loss(
-                out["stress_field_pred"],
-                stress_gt,
-                object_gt,
-                fg_weight=object_mask_fg_weight,
-                bg_weight=object_mask_bg_weight,
-                bg_black=object_mask_bg_black,
-            )
-            loss_flow_part = _object_mask_weighted_field_loss(
-                out["flow_field_pred"],
-                flow_gt,
-                object_gt,
-                fg_weight=object_mask_fg_weight,
-                bg_weight=object_mask_bg_weight,
-                bg_black=object_mask_bg_black,
-            )
-            loss_force_part = _object_mask_weighted_field_loss(
-                out["force_pred"],
-                force_gt,
-                object_gt,
-                fg_weight=object_mask_fg_weight,
-                bg_weight=object_mask_bg_weight,
-                bg_black=object_mask_bg_black,
-            )
+                gt_train_space = _to_target_params(params_gt_raw)
+                valid_mask = torch.ones_like(gt_train_space)
+                valid_mask[:, 3] = (params_gt_raw[:, 3] > 0).to(valid_mask.dtype)
 
-            action_ret = action_classification_loss(out["action_logits"], action_label)
-            phys_ret = compute_physics_consistency_losses(
-                stress_pred=out["stress_field_pred"],
-                flow_pred=out["flow_field_pred"],
-                force_pred=out["force_pred"],
-                force_gt=force_gt,
-                cfg=phys_cfg,
-            )
-
-            loss_total = (
-                loss_reg_part
-                + lambda_stress * loss_stress_part
-                + lambda_flow * loss_flow_part
-                + lambda_force * loss_force_part
-                + lambda_action * action_ret["loss_action"]
-                + lambda_phys * phys_ret["loss_phys_total"]
-            )
-
-            opt.zero_grad()
-            loss_total.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-
-            bsz = int(rgb.shape[0])
-            total += float(loss_total.item()) * bsz
-            n += bsz
-
-            if bi % 10 == 0:
-                print(
-                    "[logic_train] "
-                    f"epoch={epoch+1}/{epochs} step={bi} "
-                    f"loss={float(loss_total.item()):.6f} "
-                    f"reg={float(loss_reg_part.item()):.6f} "
-                    f"stress={float(loss_stress_part.item()):.6f} "
-                    f"flow={float(loss_flow_part.item()):.6f} "
-                    f"force={float(loss_force_part.item()):.6f} "
-                    f"action={float(action_ret['loss_action'].item()):.6f} "
-                    f"action_acc={float(action_ret['action_acc'].item()):.4f} "
-                    f"phys={float(phys_ret['loss_phys_total'].item()):.6f} "
-                    f"phys_sf={float(phys_ret['loss_stress_flow_consistency'].item()):.6f} "
-                    f"phys_fs={float(phys_ret['loss_force_stress_consistency'].item()):.6f} "
-                    f"phys_ff={float(phys_ret['loss_force_flow_consistency'].item()):.6f} "
-                    f"objmask_mean={float(object_gt.mean().item()):.4f}"
+                loss_reg_part = loss_reg(out["param_pred"], gt_train_space, out["logvar"], valid_mask=valid_mask)
+                loss_stress_part = _object_mask_weighted_field_loss(
+                    out["stress_field_pred"],
+                    stress_gt,
+                    object_gt,
+                    fg_weight=object_mask_fg_weight,
+                    bg_weight=object_mask_bg_weight,
+                    bg_black=object_mask_bg_black,
+                )
+                loss_flow_part = _object_mask_weighted_field_loss(
+                    out["flow_field_pred"],
+                    flow_gt,
+                    object_gt,
+                    fg_weight=object_mask_fg_weight,
+                    bg_weight=object_mask_bg_weight,
+                    bg_black=object_mask_bg_black,
+                )
+                loss_force_part = _object_mask_weighted_field_loss(
+                    out["force_pred"],
+                    force_gt,
+                    object_gt,
+                    fg_weight=object_mask_fg_weight,
+                    bg_weight=object_mask_bg_weight,
+                    bg_black=object_mask_bg_black,
                 )
 
-        print(f"[logic_train] epoch={epoch+1} avg_loss={total / max(n, 1):.6f}")
-        avg_loss = float(total / max(n, 1))
+                action_ret = action_classification_loss(out["action_logits"], action_label)
+                phys_ret = compute_physics_consistency_losses(
+                    stress_pred=out["stress_field_pred"],
+                    flow_pred=out["flow_field_pred"],
+                    force_pred=out["force_pred"],
+                    force_gt=force_gt,
+                    cfg=phys_cfg,
+                )
+
+                loss_total = (
+                    loss_reg_part
+                    + lambda_stress * loss_stress_part
+                    + lambda_flow * loss_flow_part
+                    + lambda_force * loss_force_part
+                    + lambda_action * action_ret["loss_action"]
+                    + lambda_phys * phys_ret["loss_phys_total"]
+                )
+
+            opt.zero_grad()
+            if use_amp:
+                scaler.scale(loss_total).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss_total.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t2 = time.perf_counter()
+
+            if rank == 0 and bi < 10:
+                print(
+                    f"[debug] bi={bi} data_time={data_time:.3f}s step_time={t2 - t1:.3f}s",
+                    flush=True,
+                )
+
+            last_end = t2
+
+            bsz = int(rgb.shape[0])
+            train_sums[0] += float(loss_total.item()) * bsz
+            train_sums[1] += float(loss_reg_part.item()) * bsz
+            train_sums[2] += float(loss_stress_part.item()) * bsz
+            train_sums[3] += float(loss_flow_part.item()) * bsz
+            train_sums[4] += float(loss_force_part.item()) * bsz
+            train_sums[5] += float(action_ret["loss_action"].item()) * bsz
+            train_sums[6] += float(phys_ret["loss_phys_total"].item()) * bsz
+            train_sums[7] += float(phys_ret["loss_stress_flow_consistency"].item()) * bsz
+            train_sums[8] += float(phys_ret["loss_force_stress_consistency"].item()) * bsz
+            train_sums[9] += float(phys_ret["loss_force_flow_consistency"].item()) * bsz
+            train_sums[10] += float(action_ret["action_acc"].item()) * bsz
+            train_sums[11] += float(bsz)
+
+            if rank == 0:
+                train_pbar.set_postfix(
+                    loss=f"{float(loss_total.item()):.4f}",
+                    reg=f"{float(loss_reg_part.item()):.4f}",
+                    acc=f"{float(action_ret['action_acc'].item()):.3f}",
+                )
+
+        if distributed:
+            t_stat = torch.tensor(train_sums, device=device, dtype=torch.float64)
+            dist.all_reduce(t_stat, op=dist.ReduceOp.SUM)
+            train_sums = [float(t_stat[i].item()) for i in range(12)]
+        n = float(train_sums[11])
+        denom = max(n, 1.0)
+        avg_loss = float(train_sums[0] / denom)
+        if rank == 0:
+            epoch_pbar.set_postfix(
+                avg_loss=f"{avg_loss:.4f}",
+                acc=f"{train_sums[10]/denom:.3f}",
+            )
+            print(
+                f"[logic_train] epoch={epoch+1} avg_loss={avg_loss:.6f} "
+                f"avg_reg={train_sums[1]/denom:.6f} avg_stress={train_sums[2]/denom:.6f} "
+                f"avg_flow={train_sums[3]/denom:.6f} avg_force={train_sums[4]/denom:.6f} "
+                f"avg_action={train_sums[5]/denom:.6f} avg_phys={train_sums[6]/denom:.6f} "
+                f"avg_action_acc={train_sums[10]/denom:.4f}"
+            )
+            if tb_writer is not None:
+                ep = int(epoch + 1)
+                tb_writer.add_scalar("train/avg_loss", avg_loss, ep)
+                tb_writer.add_scalar("train/avg_loss_reg", train_sums[1] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_stress", train_sums[2] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_flow", train_sums[3] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_force", train_sums[4] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_action", train_sums[5] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_phys_total", train_sums[6] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_phys_sf", train_sums[7] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_phys_fs", train_sums[8] / denom, ep)
+                tb_writer.add_scalar("train/avg_loss_phys_ff", train_sums[9] / denom, ep)
+                tb_writer.add_scalar("train/avg_action_acc", train_sums[10] / denom, ep)
+                tb_writer.add_scalar(
+                    "train/weighted_stress", lambda_stress * train_sums[2] / denom, ep
+                )
+                tb_writer.add_scalar("train/weighted_flow", lambda_flow * train_sums[3] / denom, ep)
+                tb_writer.add_scalar("train/weighted_force", lambda_force * train_sums[4] / denom, ep)
+                tb_writer.add_scalar("train/weighted_action", lambda_action * train_sums[5] / denom, ep)
+                tb_writer.add_scalar("train/weighted_phys", lambda_phys * train_sums[6] / denom, ep)
 
         # checkpoint（全部在 logic_model/output/checkpoints）
-        if ((epoch + 1) % save_every_epochs) == 0:
+        if ((epoch + 1) % save_every_epochs) == 0 and rank == 0:
             ckpt = {
                 "epoch": int(epoch + 1),
                 "avg_loss": avg_loss,
-                "model_state": model.state_dict(),
+                "model_state": mcore.state_dict(),
                 "optimizer_state": opt.state_dict(),
+                "scaler_state": scaler.state_dict() if use_amp else None,
                 "action_to_id": ds.action_to_id,
                 "model_hparams": {
                     "num_views": int(max_views),
-                    "in_channels": int(model.in_channels),
-                    "num_frames": int(model.num_frames),
+                    "in_channels": int(mcore.in_channels),
+                    "num_frames": int(mcore.num_frames),
                     "dec_h": int(dec_h),
                     "dec_w": int(dec_w),
                 },
@@ -609,170 +1105,206 @@ def main() -> None:
             if last_ckpt_path.exists():
                 last_ckpt_path.unlink()
 
-        # 轻量 eval（全部在 logic_model/output/eval）
+        if distributed:
+            dist.barrier()
+
+        # eval：仅计算 loss（总 loss 与各分项），写入 eval/*.json 与 tensorboard
         if ((epoch + 1) % eval_every_epochs) == 0:
-            model.eval()
-            with torch.no_grad():
-                e_total = 0.0
-                e_n = 0
-                e_action_acc = 0.0
-                e_steps = 0
-                per_sample_preds = []
-                epoch_eval_dir = eval_dir / f"epoch_{epoch + 1:04d}"
-                videos_dir = epoch_eval_dir / "videos"
-                for batch in eval_loader:
-                    rgb = batch["rgb"].to(device)
-                    stress_gt = batch["stress"].to(device)
-                    flow_gt = batch["flow"].to(device)
-                    force_gt = batch["force_mask"].to(device)
-                    object_gt = batch["object_mask"].to(device)
-                    params_gt_raw = batch["params"].to(device)
-                    action_label = batch["action_label"].to(device)
+            if eval_sampler_eval is not None:
+                eval_sampler_eval.set_epoch(epoch)
 
-                    if int(model.in_channels) == 1:
-                        x = rgb[:, :, :1, :, :, :]
-                    else:
-                        x = rgb[:, :, : int(model.in_channels), :, :, :]
-                    if int(x.shape[3]) != int(model.num_frames):
-                        x = _resample_time_bvcthw(x, int(model.num_frames))
-                        stress_gt = _resample_time_bvcthw(stress_gt, int(model.num_frames))
-                        flow_gt = _resample_time_bvcthw(flow_gt, int(model.num_frames))
-                        force_gt = _resample_time_bvcthw(force_gt, int(model.num_frames))
-                        object_gt = _resample_time_bvcthw(object_gt, int(model.num_frames))
-
-                    out = model(x)
-                    gt_train_space = _to_target_params(params_gt_raw)
-                    valid_mask = torch.ones_like(gt_train_space)
-                    valid_mask[:, 3] = (params_gt_raw[:, 3] > 0).to(valid_mask.dtype)
-
-                    loss_reg_part = loss_reg(out["param_pred"], gt_train_space, out["logvar"], valid_mask=valid_mask)
-                    loss_stress_part = _object_mask_weighted_field_loss(
-                        out["stress_field_pred"],
-                        stress_gt,
-                        object_gt,
-                        fg_weight=object_mask_fg_weight,
-                        bg_weight=object_mask_bg_weight,
-                        bg_black=object_mask_bg_black,
+            if eval_sharded:
+                model.eval()
+                ev_m = _unwrap_model(model)
+                with torch.no_grad():
+                    sums_t = torch.zeros(12, device=device, dtype=torch.float64)
+                    batch_steps = 0
+                    _eval_cap_sh = min(len(eval_loader), eval_max_batches)
+                    eval_pbar = tqdm(
+                        eval_loader,
+                        total=_eval_cap_sh,
+                        desc=f"eval(sharded) e{epoch + 1}",
+                        disable=rank != 0,
+                        leave=False,
+                        dynamic_ncols=True,
                     )
-                    loss_flow_part = _object_mask_weighted_field_loss(
-                        out["flow_field_pred"],
-                        flow_gt,
-                        object_gt,
-                        fg_weight=object_mask_fg_weight,
-                        bg_weight=object_mask_bg_weight,
-                        bg_black=object_mask_bg_black,
-                    )
-                    loss_force_part = _object_mask_weighted_field_loss(
-                        out["force_pred"],
-                        force_gt,
-                        object_gt,
-                        fg_weight=object_mask_fg_weight,
-                        bg_weight=object_mask_bg_weight,
-                        bg_black=object_mask_bg_black,
-                    )
-                    action_ret = action_classification_loss(out["action_logits"], action_label)
-                    phys_ret = compute_physics_consistency_losses(
-                        stress_pred=out["stress_field_pred"],
-                        flow_pred=out["flow_field_pred"],
-                        force_pred=out["force_pred"],
-                        force_gt=force_gt,
-                        cfg=phys_cfg,
-                    )
-                    loss_total = (
-                        loss_reg_part
-                        + lambda_stress * loss_stress_part
-                        + lambda_flow * loss_flow_part
-                        + lambda_force * loss_force_part
-                        + lambda_action * action_ret["loss_action"]
-                        + lambda_phys * phys_ret["loss_phys_total"]
-                    )
-                    bsz = int(x.shape[0])
-                    e_total += float(loss_total.item()) * bsz
-                    e_n += bsz
-                    e_action_acc += float(action_ret["action_acc"].item()) * bsz
-
-                    # 记录每个样本的参数/动作预测，并导出 stress/flow/force 预测视频
-                    probs = torch.softmax(out["action_logits"], dim=1).detach().cpu()
-                    action_pred = out["action_logits"].argmax(dim=1).detach().cpu()
-                    param_raw = out["param_pred_raw"].detach().cpu()
-                    stress_pred = out["stress_field_pred"].detach().cpu()  # [B,V,3,T,H,W]
-                    flow_pred = out["flow_field_pred"].detach().cpu()
-                    force_pred = out["force_pred"].detach().cpu()
-                    stress_gt_cpu = stress_gt.detach().cpu()
-                    flow_gt_cpu = flow_gt.detach().cpu()
-                    force_gt_cpu = force_gt.detach().cpu()
-                    object_gt_cpu = object_gt.detach().cpu()
-                    sample_ids = [str(s) for s in batch["sample_id"]]
-                    gt_actions = batch.get("action_name", [""] * len(sample_ids))
-                    action_label_cpu = action_label.detach().cpu()
-
-                    for i, sid in enumerate(sample_ids):
-                        item = {
-                            "sample_id": sid,
-                            "action_gt_name": str(gt_actions[i]) if i < len(gt_actions) else "",
-                            "action_gt_label": int(action_label_cpu[i].item()),
-                            "action_pred_label": int(action_pred[i].item()),
-                            "action_prob": probs[i].tolist(),
-                            "param_pred_raw": param_raw[i].tolist(),
-                            "object_mask_mean": float(object_gt_cpu[i].mean().item()),
-                        }
-                        per_sample_preds.append(item)
-
-                        sdir = videos_dir / sid
-                        v_lim = min(int(eval_max_video_views), int(stress_pred.shape[1]))
-                        for vi in range(v_lim):
-                            # 统一导出两套对比视频：pred_raw / gt（同一固定 value range）
-                            modal_triplets = (
-                                ("stress", stress_pred[i, vi], stress_gt_cpu[i, vi]),
-                                ("flow", flow_pred[i, vi], flow_gt_cpu[i, vi]),
-                                ("force", force_pred[i, vi], force_gt_cpu[i, vi]),
+                    for batch in eval_pbar:
+                        loss_total, parts = _compute_eval_batch_losses(
+                            model,
+                            ev_m,
+                            batch,
+                            device,
+                            loss_reg,
+                            phys_cfg,
+                            lambda_stress=lambda_stress,
+                            lambda_flow=lambda_flow,
+                            lambda_force=lambda_force,
+                            lambda_action=lambda_action,
+                            lambda_phys=lambda_phys,
+                            object_mask_fg_weight=object_mask_fg_weight,
+                            object_mask_bg_weight=object_mask_bg_weight,
+                            object_mask_bg_black=object_mask_bg_black,
+                            use_amp=use_amp,
+                            non_blocking=nb,
+                        )
+                        bsz = int(batch["rgb"].shape[0])
+                        sums_t[0] += float(loss_total.item()) * bsz
+                        sums_t[1] += float(parts["loss_reg"].item()) * bsz
+                        sums_t[2] += float(parts["loss_stress"].item()) * bsz
+                        sums_t[3] += float(parts["loss_flow"].item()) * bsz
+                        sums_t[4] += float(parts["loss_force"].item()) * bsz
+                        sums_t[5] += float(parts["loss_action"].item()) * bsz
+                        sums_t[6] += float(parts["loss_phys_total"].item()) * bsz
+                        sums_t[7] += float(parts["loss_phys_sf"].item()) * bsz
+                        sums_t[8] += float(parts["loss_phys_fs"].item()) * bsz
+                        sums_t[9] += float(parts["loss_phys_ff"].item()) * bsz
+                        sums_t[10] += float(parts["action_acc"].item()) * bsz
+                        sums_t[11] += float(bsz)
+                        batch_steps += 1
+                        if rank == 0:
+                            _sn = float(sums_t[11].item())
+                            eval_pbar.set_postfix(
+                                loss=f"{float(sums_t[0].item()/max(_sn,1.0)):.4f}",
+                                acc=f"{float(sums_t[10].item()/max(_sn,1.0)):.3f}",
                             )
-                            for modal_name, pred_tchw, gt_tchw in modal_triplets:
-                                pred_raw_tc_hw = pred_tchw.permute(1, 0, 2, 3).contiguous()  # [T,3,H,W]
-                                gt_tc_hw = gt_tchw.permute(1, 0, 2, 3).contiguous()
-                                _save_rgb_video_mp4(
-                                    _tensor_video_to_u8_rgb_frames(
-                                        pred_raw_tc_hw,
-                                        colormap=eval_video_colormap,
-                                        value_min=eval_video_value_min,
-                                        value_max=eval_video_value_max,
-                                    ),
-                                    sdir / f"{modal_name}_pred_raw_view{vi:02d}.mp4",
-                                    fps=eval_video_fps,
-                                )
-                                _save_rgb_video_mp4(
-                                    _tensor_video_to_u8_rgb_frames(
-                                        gt_tc_hw,
-                                        colormap=eval_video_colormap,
-                                        value_min=eval_video_value_min,
-                                        value_max=eval_video_value_max,
-                                    ),
-                                    sdir / f"{modal_name}_gt_view{vi:02d}.mp4",
-                                    fps=eval_video_fps,
-                                )
+                        if batch_steps >= eval_max_batches:
+                            break
 
-                    e_steps += 1
-                    if e_steps >= eval_batches:
-                        break
-            eval_obj = {
-                "epoch": int(epoch + 1),
-                "eval_batches": int(min(e_steps, eval_batches)),
-                "avg_loss": float(e_total / max(e_n, 1)),
-                "avg_action_acc": float(e_action_acc / max(e_n, 1)),
-                "num_samples": int(e_n),
-                "video_value_range": [float(eval_video_value_min), float(eval_video_value_max)],
-                "video_root": str((eval_dir / f"epoch_{epoch + 1:04d}" / "videos").resolve()),
-                "per_sample_predictions": per_sample_preds,
-            }
-            (eval_dir / f"epoch_{epoch + 1:04d}.json").write_text(
-                json.dumps(eval_obj, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            (eval_dir / "last.json").write_text(
-                json.dumps(eval_obj, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            model.train()
+                dist.all_reduce(sums_t, op=dist.ReduceOp.SUM)
+                sums_list = [float(sums_t[i].item()) for i in range(12)]
+                if rank == 0:
+                    ep = int(epoch + 1)
+                    metrics = _eval_sums_to_record(
+                        sums_list,
+                        lambda_stress=lambda_stress,
+                        lambda_flow=lambda_flow,
+                        lambda_force=lambda_force,
+                        lambda_action=lambda_action,
+                        lambda_phys=lambda_phys,
+                    )
+                    eval_obj: Dict[str, Any] = {
+                        "epoch": ep,
+                        "eval_mode": "distributed_sharded",
+                        "eval_max_batches": int(eval_max_batches),
+                        "eval_batches_run": int(min(batch_steps, eval_max_batches)),
+                    }
+                    eval_obj.update(metrics)
+                    (eval_dir / f"epoch_{epoch + 1:04d}.json").write_text(
+                        json.dumps(eval_obj, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    (eval_dir / "last.json").write_text(
+                        json.dumps(eval_obj, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    if tb_writer is not None:
+                        _tensorboard_log_eval_metrics(tb_writer, metrics, ep)
+                    print(
+                        f"[logic_train] eval done (sharded): avg_loss={metrics['avg_loss']:.6f} "
+                        f"avg_action_acc={metrics['avg_action_acc']:.4f} "
+                        f"num_samples={metrics['num_samples']}",
+                        flush=True,
+                    )
+                model.train()
+
+            elif rank == 0:
+                model.eval()
+                ev_m = _unwrap_model(model)
+                with torch.no_grad():
+                    sums_list = [0.0] * 12
+                    batch_steps = 0
+                    _eval_cap = min(len(eval_loader), eval_max_batches)
+                    eval_pbar = tqdm(
+                        eval_loader,
+                        total=_eval_cap,
+                        desc=f"eval e{epoch + 1}",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                    for batch in eval_pbar:
+                        loss_total, parts = _compute_eval_batch_losses(
+                            model,
+                            ev_m,
+                            batch,
+                            device,
+                            loss_reg,
+                            phys_cfg,
+                            lambda_stress=lambda_stress,
+                            lambda_flow=lambda_flow,
+                            lambda_force=lambda_force,
+                            lambda_action=lambda_action,
+                            lambda_phys=lambda_phys,
+                            object_mask_fg_weight=object_mask_fg_weight,
+                            object_mask_bg_weight=object_mask_bg_weight,
+                            object_mask_bg_black=object_mask_bg_black,
+                            use_amp=use_amp,
+                            non_blocking=nb,
+                        )
+                        bsz = int(batch["rgb"].shape[0])
+                        sums_list[0] += float(loss_total.item()) * bsz
+                        sums_list[1] += float(parts["loss_reg"].item()) * bsz
+                        sums_list[2] += float(parts["loss_stress"].item()) * bsz
+                        sums_list[3] += float(parts["loss_flow"].item()) * bsz
+                        sums_list[4] += float(parts["loss_force"].item()) * bsz
+                        sums_list[5] += float(parts["loss_action"].item()) * bsz
+                        sums_list[6] += float(parts["loss_phys_total"].item()) * bsz
+                        sums_list[7] += float(parts["loss_phys_sf"].item()) * bsz
+                        sums_list[8] += float(parts["loss_phys_fs"].item()) * bsz
+                        sums_list[9] += float(parts["loss_phys_ff"].item()) * bsz
+                        sums_list[10] += float(parts["action_acc"].item()) * bsz
+                        sums_list[11] += float(bsz)
+                        batch_steps += 1
+                        _sn = sums_list[11]
+                        eval_pbar.set_postfix(
+                            loss=f"{sums_list[0]/max(_sn,1.0):.4f}",
+                            acc=f"{sums_list[10]/max(_sn,1.0):.3f}",
+                        )
+                        if batch_steps >= eval_max_batches:
+                            break
+
+                ep = int(epoch + 1)
+                metrics = _eval_sums_to_record(
+                    sums_list,
+                    lambda_stress=lambda_stress,
+                    lambda_flow=lambda_flow,
+                    lambda_force=lambda_force,
+                    lambda_action=lambda_action,
+                    lambda_phys=lambda_phys,
+                )
+                eval_obj = {
+                    "epoch": ep,
+                    "eval_mode": "rank0_only",
+                    "eval_max_batches": int(eval_max_batches),
+                    "eval_batches_run": int(min(batch_steps, eval_max_batches)),
+                }
+                eval_obj.update(metrics)
+                (eval_dir / f"epoch_{epoch + 1:04d}.json").write_text(
+                    json.dumps(eval_obj, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                (eval_dir / "last.json").write_text(
+                    json.dumps(eval_obj, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                if tb_writer is not None:
+                    _tensorboard_log_eval_metrics(tb_writer, metrics, ep)
+                print(
+                    f"[logic_train] eval done: avg_loss={metrics['avg_loss']:.6f} "
+                    f"avg_action_acc={metrics['avg_action_acc']:.4f} num_samples={metrics['num_samples']}",
+                    flush=True,
+                )
+                model.train()
+
+        if distributed:
+            dist.barrier()
+
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank == 0:
+        if tb_writer is not None:
+            tb_writer.close()
+        print("[logic_train] training finished.", flush=True)
 
 
 if __name__ == "__main__":

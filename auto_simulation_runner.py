@@ -1,10 +1,12 @@
 import argparse
+import ctypes
 import json
 import os
 import random
 import subprocess
 import sys
 import time
+import re
 from collections import deque
 from dataclasses import dataclass
 import itertools
@@ -13,12 +15,47 @@ from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 
+def _ensure_maca_runtime_libs() -> None:
+    maca_root = os.environ.get("MACA_PATH", "/opt/maca-3.3.0")
+    cand = [
+        os.path.join(maca_root, "tools", "cu-bridge", "lib"),
+        os.path.join(maca_root, "lib"),
+        os.path.join(maca_root, "ompi", "lib"),
+        os.path.join(maca_root, "ucx", "lib"),
+    ]
+    old = os.environ.get("LD_LIBRARY_PATH", "")
+    parts = [p for p in old.split(os.pathsep) if p]
+    for p in reversed(cand):
+        if os.path.exists(p) and p not in parts:
+            parts.insert(0, p)
+    if parts:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(parts)
+    # 进程内预加载关键 MPI/UCX 依赖，避免后续 import torch 时找不到 libmpi.so.40
+    preload_libs = [
+        os.path.join(maca_root, "ompi", "lib", "libopen-pal.so.40"),
+        os.path.join(maca_root, "ompi", "lib", "libopen-rte.so.40"),
+        os.path.join(maca_root, "ompi", "lib", "libmpi.so.40"),
+        os.path.join(maca_root, "ucx", "lib", "libucs.so.0"),
+        os.path.join(maca_root, "ucx", "lib", "libuct.so.0"),
+        os.path.join(maca_root, "ucx", "lib", "libucp.so.0"),
+    ]
+    for lib in preload_libs:
+        if os.path.exists(lib):
+            try:
+                ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_ensure_maca_runtime_libs()
+
+
 def _nvidia_smi_gpu_states() -> Optional[List[Tuple[int, int, int]]]:
     """
     查询各物理 GPU 的 index、空闲显存与利用率（动态占卡仅使用利用率）。
     返回 [(index, memory_free_mib, utilization_gpu_pct), ...]；失败返回 None。
     """
-    try:
+    def _from_nvidia_smi() -> Optional[List[Tuple[int, int, int]]]:
         result = subprocess.check_output(
             [
                 "nvidia-smi",
@@ -27,15 +64,50 @@ def _nvidia_smi_gpu_states() -> Optional[List[Tuple[int, int, int]]]:
             ],
             stderr=subprocess.DEVNULL,
             timeout=60,
+            text=True,
         )
-        lines = result.decode("utf-8").strip().split("\n")
         out: List[Tuple[int, int, int]] = []
-        for line in lines:
+        for line in result.strip().split("\n"):
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != 3:
                 continue
             out.append((int(parts[0]), int(parts[1]), int(parts[2])))
         return out if out else None
+
+    def _from_mx_smi() -> Optional[List[Tuple[int, int, int]]]:
+        # mx-smi 不支持 --query-gpu，改为解析文本：GPU#N + vram total/used + Utilization GPU%
+        result = subprocess.check_output(
+            ["mx-smi", "--show-memory", "--show-usage"],
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            text=True,
+        )
+        blocks = re.split(r"\nGPU#(\d+)\s+", result)
+        out: List[Tuple[int, int, int]] = []
+        for i in range(1, len(blocks), 2):
+            gpu_id = int(blocks[i])
+            block = blocks[i + 1]
+            m_total = re.search(r"vram total\s*:\s*(\d+)\s*KB", block)
+            m_used = re.search(r"vram used\s*:\s*(\d+)\s*KB", block)
+            m_util = re.search(r"GPU\s*:\s*(\d+)\s*%", block)
+            if not (m_total and m_used and m_util):
+                continue
+            total_kb = int(m_total.group(1))
+            used_kb = int(m_used.group(1))
+            util = int(m_util.group(1))
+            free_mib = max(total_kb - used_kb, 0) // 1024
+            out.append((gpu_id, free_mib, util))
+        return out if out else None
+
+    # 优先 MetaX，再回退 NVIDIA
+    try:
+        states = _from_mx_smi()
+        if states:
+            return states
+    except Exception:
+        pass
+    try:
+        return _from_nvidia_smi()
     except Exception:
         return None
 
@@ -793,13 +865,24 @@ def run() -> None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     modified_sim = os.path.join(script_dir, "modified_simulation.py")
 
-    # 子进程需能加载 torch 的 libc10.so 等，否则 simple_knn/diff_gaussian_rasterization 会报错
+    # 子进程需能加载 torch 与 MACA/cu-bridge 运行库：
+    # - torch lib: 保障 simple_knn/diff_gaussian_rasterization 等扩展可链接
+    # - maca/cu-bridge lib: 保障 warp 可找到 libcuda.so（MetaX 兼容层）
     import torch as _torch
     _torch_lib = os.path.join(os.path.dirname(_torch.__file__), "lib")
+    _maca_lib_dirs = [
+        "/opt/maca-3.3.0/tools/cu-bridge/lib",
+        "/opt/maca-3.3.0/lib",
+    ]
     _run_env = os.environ.copy()
-    _run_env["LD_LIBRARY_PATH"] = os.pathsep.join(
-        [_torch_lib] + (_run_env.get("LD_LIBRARY_PATH") or "").split(os.pathsep)
-    ).rstrip(os.pathsep)
+    _ld_parts: List[str] = []
+    for p in [_torch_lib] + _maca_lib_dirs + (_run_env.get("LD_LIBRARY_PATH") or "").split(os.pathsep):
+        if not p:
+            continue
+        if p not in _ld_parts:
+            _ld_parts.append(p)
+    if _ld_parts:
+        _run_env["LD_LIBRARY_PATH"] = os.pathsep.join(_ld_parts)
 
     tmp_cfg_dir = os.path.join(train_cfg.get("output_root", os.path.join(script_dir, "auto_output")), "_tmp_configs")
     os.makedirs(tmp_cfg_dir, exist_ok=True)

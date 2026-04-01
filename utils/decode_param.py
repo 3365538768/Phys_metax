@@ -235,7 +235,7 @@ def decode_param_json(json_file):
 
 
 def set_boundary_conditions(
-    mpm_solver: MPM_Simulator_WARP, bc_params: dict, time_params: dict
+    mpm_solver: MPM_Simulator_WARP, bc_params: dict, time_params: dict, device: str = "cuda:0"
 ):
     for bc in bc_params:
         if bc["type"] == "cuboid":
@@ -283,6 +283,7 @@ def set_boundary_conditions(
                 size=size,
                 num_dt=num_dt,
                 start_time=start_time,
+                device=device,
             )
         elif bc["type"] == "bounding_box":
             mpm_solver.add_bounding_box()
@@ -300,6 +301,7 @@ def set_boundary_conditions(
                 velocity=bc["velocity"],
                 start_time=bc["start_time"],
                 end_time=bc["end_time"],
+                device=device,
             )
         elif bc["type"] == "surface_collider":
             assert "point" in bc.keys()
@@ -337,6 +339,7 @@ def set_boundary_conditions(
                 num_layers=bc["num_layers"],
                 start_time=bc["start_time"],
                 end_time=bc["end_time"],
+                device=device,
             )
         elif bc["type"] == "enforce_particle_velocity_rotation":
             assert "normal" in bc.keys()
@@ -355,6 +358,7 @@ def set_boundary_conditions(
                 translation_scale=bc["translation_scale"],
                 start_time=bc["start_time"],
                 end_time=bc["end_time"],
+                device=device,
             )
         elif bc["type"] == "set_velocity_on_cuboid":
             assert "point" in bc and "size" in bc and "velocity" in bc
