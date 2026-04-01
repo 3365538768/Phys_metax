@@ -46,6 +46,7 @@ from logic_model.losses import (
     compute_physics_consistency_losses,
 )
 from logic_model.model import LogicPhysModel
+from logic_model.model2 import LogicPhysModel2
 
 
 def _pick(d: Dict[str, Any], k: str, default: Any) -> Any:
@@ -104,19 +105,103 @@ def _load_split_json(path: Path) -> Dict[str, Any]:
     return raw
 
 
+def _default_project_torchhub_dir() -> Path:
+    # Phys/logic_model/train.py -> Phys/.torch/hub
+    return (Path(__file__).resolve().parent.parent / ".torch" / "hub").resolve()
+
+
+def _resolve_torchhub_dir(cfg_model: Dict[str, Any]) -> Path:
+    cfg_dir = str(_pick(cfg_model, "torchhub_dir", "") or "").strip()
+    if cfg_dir:
+        p = Path(cfg_dir).expanduser()
+        if p.is_absolute():
+            return p.resolve()
+        return (Path.cwd() / p).resolve()
+    env_home = str(os.environ.get("TORCH_HOME", "") or "").strip()
+    if env_home:
+        return (Path(env_home).expanduser().resolve() / "hub").resolve()
+    return _default_project_torchhub_dir()
+
+
+def _configure_torchhub_dir(hub_dir: Path) -> Path:
+    hub_dir = Path(hub_dir).expanduser().resolve()
+    hub_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCH_HOME"] = str(hub_dir.parent)
+    torch.hub.set_dir(str(hub_dir))
+    return hub_dir
+
+
+def _expected_torchhub_repo_dir(repo: str) -> str:
+    # torch.hub: "owner/name:ref" -> "owner_name_ref"
+    s = str(repo).replace(":", "_").replace("/", "_")
+    return s
+
+
+def _expected_dino_ckpt_basename(backbone_name: str) -> str:
+    name = str(backbone_name).strip().lower()
+    table = {
+        "dinov2_vits14": "dinov2_vits14_pretrain.pth",
+        "dinov2_vitb14": "dinov2_vitb14_pretrain.pth",
+        "dinov2_vitl14": "dinov2_vitl14_pretrain.pth",
+        "dinov2_vitg14": "dinov2_vitg14_pretrain.pth",
+    }
+    return table.get(name, "")
+
+
+def _prewarm_torchhub_dino(cfg_model: Dict[str, Any], hub_dir: Path) -> None:
+    """
+    仅做本地缓存检查，不触发在线下载。
+    """
+    source = str(_pick(cfg_model, "dino_backbone_source", "torchhub")).lower().strip()
+    if source not in ("torchhub", "hub"):
+        return
+    repo = str(_pick(cfg_model, "dino_torchhub_repo", "facebookresearch/dinov2:main"))
+    repo_dir = hub_dir / _expected_torchhub_repo_dir(repo)
+    if not repo_dir.is_dir():
+        raise FileNotFoundError(
+            f"torchhub repo 缓存缺失: {repo_dir}。请先手动准备本地 hub 缓存（不走在线下载）。"
+        )
+
+    if bool(_pick(cfg_model, "dino_backbone_pretrained", True)):
+        ckpt_name = _expected_dino_ckpt_basename(str(_pick(cfg_model, "dino_backbone_name", "dinov2_vits14")))
+        if ckpt_name:
+            ckpt_path = hub_dir / "checkpoints" / ckpt_name
+            if not ckpt_path.is_file():
+                raise FileNotFoundError(
+                    f"DINO checkpoint 缓存缺失: {ckpt_path}。请手动下载到 Phys/.torch/hub/checkpoints。"
+                )
+
+
 def _init_distributed() -> Tuple[bool, int, int, int]:
-    """WORLD_SIZE>1 时初始化进程组，返回 (distributed, rank, local_rank, world_size)。"""
+    """仅解析 WORLD_SIZE/RANK/LOCAL_RANK，返回 (distributed, rank, local_rank, world_size)。"""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return False, 0, 0, 1
-    if not dist.is_available():
-        raise RuntimeError("torch.distributed 不可用")
-    if not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://")
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     return True, rank, local_rank, world_size
+
+
+def _safe_barrier(local_rank: Optional[int] = None) -> None:
+    """
+    分布式同步的安全包装：
+    - 未初始化/单卡时直接返回
+    - CUDA 多卡时显式传 device_ids，避免 NCCL barrier 设备推断异常
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    backend = str(dist.get_backend())
+    if backend == "nccl":
+        # 某些环境的 NCCL barrier 会触发 CUDA invalid argument；
+        # 用 1 元 all_reduce 作为等价同步更稳。
+        if not torch.cuda.is_available():
+            dist.barrier()
+            return
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        t = torch.zeros(1, device=dev, dtype=torch.int32)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return
+    dist.barrier()
 
 
 def _unwrap_model(m: torch.nn.Module) -> torch.nn.Module:
@@ -608,8 +693,19 @@ def main() -> None:
     if distributed:
         if not torch.cuda.is_available():
             raise RuntimeError("DDP 训练需要 CUDA")
+        # 先绑定当前进程的本地 GPU，再初始化进程组，避免后续 collective 使用错误设备。
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        if not dist.is_available():
+            raise RuntimeError("torch.distributed 不可用")
+        if not dist.is_initialized():
+            backend = str(os.environ.get("DIST_BACKEND", "nccl")).strip() or "nccl"
+            init_kwargs: Dict[str, Any] = {"backend": backend, "init_method": "env://"}
+            # torch 新版本支持 device_id；支持时可减少 "No device id ..." 警告。
+            try:
+                dist.init_process_group(**init_kwargs, device_id=device)
+            except TypeError:
+                dist.init_process_group(**init_kwargs)
     else:
         device_str = str(_cli_or_pick_cfg(args.device, cfg_train, "device", "cuda"))
         if device_str.startswith("cuda") and not torch.cuda.is_available():
@@ -698,26 +794,76 @@ def main() -> None:
         sample0 = ds[0]
         model_num_frames = int(sample0["rgb"].shape[2])
 
-    model = LogicPhysModel(
-        num_views=max_views,
-        in_channels=int(_pick(cfg_model, "in_channels", 3)),
-        num_frames=int(_pick(cfg_model, "num_frames", model_num_frames)),
-        img_size=int(_pick(cfg_model, "img_size", img_size if img_size > 0 else 224)),
-        num_targets=4,
-        num_actions=ds.num_actions,
-        dec_h=dec_h,
-        dec_w=dec_w,
-        encoder_embed_dim=int(_pick(cfg_model, "encoder_embed_dim", 384)),
-        encoder_depth=int(_pick(cfg_model, "encoder_depth", 6)),
-        encoder_num_heads=int(_pick(cfg_model, "encoder_num_heads", 6)),
-        tubelet_size=int(_pick(cfg_model, "tubelet_size", 1)),
-        patch_size=int(_pick(cfg_model, "patch_size", 32)),
-        fusion_dim=int(_pick(cfg_model, "fusion_dim", 512)),
-        fusion_heads=int(_pick(cfg_model, "fusion_heads", 8)),
-        head_dropout=float(_pick(cfg_model, "head_dropout", 0.1)),
-        use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
-        bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
-    ).to(device)
+    model_arch = str(_pick(cfg_model, "arch", "logic_v1")).strip().lower()
+    if model_arch in ("logic_v2_dino", "logic_v2", "dino", "dinov2"):
+        hub_dir = _configure_torchhub_dir(_resolve_torchhub_dir(cfg_model))
+        if rank == 0 and bool(_pick(cfg_train, "torchhub_log_dir", True)):
+            print(f"[logic_train] torchhub_dir={torch.hub.get_dir()}", flush=True)
+            print(f"[logic_train] TORCH_HOME={os.environ.get('TORCH_HOME', '')}", flush=True)
+        do_prewarm = bool(_pick(cfg_train, "torchhub_prewarm", True))
+        require_cache = bool(_pick(cfg_train, "torchhub_require_cache", True))
+        if distributed and do_prewarm:
+            if rank == 0:
+                if require_cache:
+                    _prewarm_torchhub_dino(cfg_model, hub_dir)
+            _safe_barrier(local_rank if distributed else None)
+        elif (not distributed) and do_prewarm:
+            if require_cache:
+                _prewarm_torchhub_dino(cfg_model, hub_dir)
+    if model_arch in ("logic_v2_dino", "logic_v2", "dino", "dinov2"):
+        model = LogicPhysModel2(
+            num_views=max_views,
+            in_channels=int(_pick(cfg_model, "in_channels", 3)),
+            num_frames=int(_pick(cfg_model, "num_frames", model_num_frames)),
+            img_size=int(_pick(cfg_model, "img_size", img_size if img_size > 0 else 224)),
+            num_targets=4,
+            num_actions=ds.num_actions,
+            dec_h=dec_h,
+            dec_w=dec_w,
+            fusion_dim=int(_pick(cfg_model, "fusion_dim", 512)),
+            fusion_heads=int(_pick(cfg_model, "fusion_heads", 8)),
+            head_dropout=float(_pick(cfg_model, "head_dropout", 0.1)),
+            use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
+            bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
+            dino_backbone_name=str(_pick(cfg_model, "dino_backbone_name", "dinov2_vits14")),
+            dino_backbone_pretrained=bool(_pick(cfg_model, "dino_backbone_pretrained", True)),
+            dino_backbone_source=str(_pick(cfg_model, "dino_backbone_source", "torchhub")),
+            dino_out_dim=int(_pick(cfg_model, "dino_out_dim", 384)),
+            temporal_adapter_type=str(_pick(cfg_model, "temporal_adapter_type", "transformer")),
+            temporal_adapter_layers=int(_pick(cfg_model, "temporal_adapter_layers", 2)),
+            temporal_adapter_heads=int(_pick(cfg_model, "temporal_adapter_heads", 6)),
+            temporal_adapter_dropout=float(_pick(cfg_model, "temporal_adapter_dropout", 0.1)),
+            frame_pool=str(_pick(cfg_model, "frame_pool", "mean")),
+            freeze_backbone=bool(_pick(cfg_model, "freeze_backbone", True)),
+            torchhub_dir=str(torch.hub.get_dir()),
+            dino_torchhub_repo=str(_pick(cfg_model, "dino_torchhub_repo", "facebookresearch/dinov2:main")),
+            dino_force_reload=bool(_pick(cfg_model, "dino_force_reload", False)),
+            dino_trust_repo=bool(_pick(cfg_model, "dino_trust_repo", True)),
+            dino_skip_validation=bool(_pick(cfg_model, "dino_skip_validation", True)),
+            dino_hub_verbose=bool(_pick(cfg_model, "dino_hub_verbose", False)),
+            dino_log_torchhub_dir=bool(_pick(cfg_model, "dino_log_torchhub_dir", False)),
+        ).to(device)
+    else:
+        model = LogicPhysModel(
+            num_views=max_views,
+            in_channels=int(_pick(cfg_model, "in_channels", 3)),
+            num_frames=int(_pick(cfg_model, "num_frames", model_num_frames)),
+            img_size=int(_pick(cfg_model, "img_size", img_size if img_size > 0 else 224)),
+            num_targets=4,
+            num_actions=ds.num_actions,
+            dec_h=dec_h,
+            dec_w=dec_w,
+            encoder_embed_dim=int(_pick(cfg_model, "encoder_embed_dim", 384)),
+            encoder_depth=int(_pick(cfg_model, "encoder_depth", 6)),
+            encoder_num_heads=int(_pick(cfg_model, "encoder_num_heads", 6)),
+            tubelet_size=int(_pick(cfg_model, "tubelet_size", 1)),
+            patch_size=int(_pick(cfg_model, "patch_size", 32)),
+            fusion_dim=int(_pick(cfg_model, "fusion_dim", 512)),
+            fusion_heads=int(_pick(cfg_model, "fusion_heads", 8)),
+            head_dropout=float(_pick(cfg_model, "head_dropout", 0.1)),
+            use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
+            bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
+        ).to(device)
     if distributed:
         model = DDP(
             model,
@@ -725,10 +871,49 @@ def main() -> None:
             output_device=local_rank,
             find_unused_parameters=False,
         )
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(_cli_or_pick_cfg(args.lr, cfg_train, "lr", 3e-4)),
-    )
+    base_lr = float(_cli_or_pick_cfg(args.lr, cfg_train, "lr", 3e-4))
+    use_param_groups = bool(_pick(cfg_train, "use_param_groups", False))
+    backbone_lr: Optional[float] = None
+    head_lr: Optional[float] = None
+    wd_backbone: Optional[float] = None
+    wd_head: Optional[float] = None
+    if use_param_groups and model_arch in ("logic_v2_dino", "logic_v2", "dino", "dinov2"):
+        head_lr = float(_pick(cfg_train, "head_lr", base_lr))
+        backbone_lr = float(_pick(cfg_train, "backbone_lr", head_lr * 0.1))
+        wd_head = float(_pick(cfg_train, "weight_decay_head", 0.01))
+        wd_backbone = float(_pick(cfg_train, "weight_decay_backbone", wd_head))
+
+        mopt = _unwrap_model(model)
+        backbone_params: List[torch.nn.Parameter] = []
+        head_params: List[torch.nn.Parameter] = []
+        for n, p in mopt.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.startswith("frame_encoder."):
+                backbone_params.append(p)
+            else:
+                head_params.append(p)
+
+        param_groups: List[Dict[str, Any]] = []
+        if backbone_params:
+            param_groups.append(
+                {"params": backbone_params, "lr": backbone_lr, "weight_decay": wd_backbone}
+            )
+        if head_params:
+            param_groups.append(
+                {"params": head_params, "lr": head_lr, "weight_decay": wd_head}
+            )
+        opt = torch.optim.AdamW(param_groups, lr=head_lr)
+    else:
+        if use_param_groups and rank == 0 and model_arch not in ("logic_v2_dino", "logic_v2", "dino", "dinov2"):
+            print(
+                f"[logic_train] WARN use_param_groups=true 但 model_arch={model_arch} 非 dino，回退为单学习率 AdamW。",
+                flush=True,
+            )
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=base_lr,
+        )
     scaler = GradScaler(enabled=use_amp)
 
     loss_reg = Arch4RegressionLoss(Arch4LossConfig())
@@ -824,6 +1009,7 @@ def main() -> None:
         print(f"[logic_train] action_to_id={json.dumps(ds.action_to_id, ensure_ascii=False)}")
         print(f"[logic_train] model_num_frames={_unwrap_model(model).num_frames}")
         print(f"[logic_train] device={device}")
+        print(f"[logic_train] model_arch={model_arch}")
         print(f"[logic_train] amp_fp16={use_amp}")
         print(
             f"[logic_train] dataloader: num_workers={nw} pin_memory={pin_memory} "
@@ -835,6 +1021,14 @@ def main() -> None:
             f"[logic_train] eval: every {eval_every_epochs} epoch(s), "
             f"max_batches={eval_max_batches}, eval_sharded={eval_sharded}"
         )
+        if use_param_groups:
+            print(
+                f"[logic_train] optimizer param_groups=True backbone_lr={backbone_lr} head_lr={head_lr} "
+                f"wd_backbone={wd_backbone} wd_head={wd_head}",
+                flush=True,
+            )
+        else:
+            print(f"[logic_train] optimizer param_groups=False lr={base_lr}", flush=True)
 
     if rank == 0:
         (output_root / "action_to_id.json").write_text(
@@ -871,6 +1065,13 @@ def main() -> None:
                         "dataloader_persistent_workers": bool(nw > 0),
                         "dataloader_prefetch_factor": int(prefetch_factor) if nw > 0 else None,
                         "model_num_frames": int(_unwrap_model(model).num_frames),
+                        "model_arch": str(model_arch),
+                        "optimizer_use_param_groups": bool(use_param_groups),
+                        "optimizer_base_lr": float(base_lr),
+                        "optimizer_backbone_lr": (None if backbone_lr is None else float(backbone_lr)),
+                        "optimizer_head_lr": (None if head_lr is None else float(head_lr)),
+                        "optimizer_weight_decay_backbone": (None if wd_backbone is None else float(wd_backbone)),
+                        "optimizer_weight_decay_head": (None if wd_head is None else float(wd_head)),
                         "output_root": str(output_root),
                         "tensorboard_dir": str(tensorboard_dir),
                         "epochs": int(epochs),
@@ -1081,6 +1282,37 @@ def main() -> None:
 
         # checkpoint（全部在 logic_model/output/checkpoints）
         if ((epoch + 1) % save_every_epochs) == 0 and rank == 0:
+            model_hparams = {
+                "arch": str(model_arch),
+                "num_views": int(max_views),
+                "in_channels": int(mcore.in_channels),
+                "num_frames": int(mcore.num_frames),
+                "dec_h": int(dec_h),
+                "dec_w": int(dec_w),
+            }
+            if model_arch in ("logic_v2_dino", "logic_v2", "dino", "dinov2"):
+                model_hparams.update(
+                    {
+                        "dino_backbone_name": str(_pick(cfg_model, "dino_backbone_name", "dinov2_vits14")),
+                        "dino_backbone_pretrained": bool(_pick(cfg_model, "dino_backbone_pretrained", True)),
+                        "dino_backbone_source": str(_pick(cfg_model, "dino_backbone_source", "torchhub")),
+                        "dino_torchhub_repo": str(_pick(cfg_model, "dino_torchhub_repo", "facebookresearch/dinov2:main")),
+                        "torchhub_dir": str(torch.hub.get_dir()),
+                        "dino_force_reload": bool(_pick(cfg_model, "dino_force_reload", False)),
+                        "dino_trust_repo": bool(_pick(cfg_model, "dino_trust_repo", True)),
+                        "dino_skip_validation": bool(_pick(cfg_model, "dino_skip_validation", True)),
+                        "dino_hub_verbose": bool(_pick(cfg_model, "dino_hub_verbose", False)),
+                        "dino_log_torchhub_dir": bool(_pick(cfg_model, "dino_log_torchhub_dir", False)),
+                        "dino_out_dim": int(_pick(cfg_model, "dino_out_dim", 384)),
+                        "temporal_adapter_type": str(_pick(cfg_model, "temporal_adapter_type", "transformer")),
+                        "temporal_adapter_layers": int(_pick(cfg_model, "temporal_adapter_layers", 2)),
+                        "temporal_adapter_heads": int(_pick(cfg_model, "temporal_adapter_heads", 6)),
+                        "temporal_adapter_dropout": float(_pick(cfg_model, "temporal_adapter_dropout", 0.1)),
+                        "frame_pool": str(_pick(cfg_model, "frame_pool", "mean")),
+                        "freeze_backbone": bool(_pick(cfg_model, "freeze_backbone", True)),
+                    }
+                )
+
             ckpt = {
                 "epoch": int(epoch + 1),
                 "avg_loss": avg_loss,
@@ -1088,13 +1320,7 @@ def main() -> None:
                 "optimizer_state": opt.state_dict(),
                 "scaler_state": scaler.state_dict() if use_amp else None,
                 "action_to_id": ds.action_to_id,
-                "model_hparams": {
-                    "num_views": int(max_views),
-                    "in_channels": int(mcore.in_channels),
-                    "num_frames": int(mcore.num_frames),
-                    "dec_h": int(dec_h),
-                    "dec_w": int(dec_w),
-                },
+                "model_hparams": model_hparams,
             }
             torch.save(ckpt, str(ckpt_dir / f"epoch_{epoch + 1:04d}.pt"))
             # 明确不维护 best/last checkpoint，避免误用历史 best.pt / last.pt。
@@ -1106,7 +1332,7 @@ def main() -> None:
                 last_ckpt_path.unlink()
 
         if distributed:
-            dist.barrier()
+            _safe_barrier(local_rank if distributed else None)
 
         # eval：仅计算 loss（总 loss 与各分项），写入 eval/*.json 与 tensorboard
         if ((epoch + 1) % eval_every_epochs) == 0:
@@ -1296,10 +1522,10 @@ def main() -> None:
                 model.train()
 
         if distributed:
-            dist.barrier()
+            _safe_barrier(local_rank if distributed else None)
 
     if distributed:
-        dist.barrier()
+        _safe_barrier(local_rank if distributed else None)
         dist.destroy_process_group()
     if rank == 0:
         if tb_writer is not None:

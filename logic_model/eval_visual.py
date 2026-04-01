@@ -45,6 +45,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from logic_model.dataset import LmdbGtDataset, collate_lmdb_gt_batch
 from logic_model.model import LogicPhysModel
+from logic_model.model2 import LogicPhysModel2
 
 
 def _pick(d: Dict[str, Any], k: str, default: Any) -> Any:
@@ -601,26 +602,59 @@ def main() -> None:
         sample0 = ds_test[0]
         num_frames_model = int(sample0["rgb"].shape[2])
 
-    model = LogicPhysModel(
-        num_views=int(mh.get("num_views", max_views)),
-        in_channels=int(mh.get("in_channels", _pick(cfg_model, "in_channels", 3))),
-        num_frames=int(mh.get("num_frames", num_frames_model)),
-        img_size=int(_pick(cfg_model, "img_size", img_size if img_size > 0 else 224)),
-        num_targets=4,
-        num_actions=ds_train.num_actions,
-        dec_h=int(mh.get("dec_h", dec_h)),
-        dec_w=int(mh.get("dec_w", dec_w)),
-        encoder_embed_dim=int(_pick(cfg_model, "encoder_embed_dim", 384)),
-        encoder_depth=int(_pick(cfg_model, "encoder_depth", 6)),
-        encoder_num_heads=int(_pick(cfg_model, "encoder_num_heads", 6)),
-        tubelet_size=int(_pick(cfg_model, "tubelet_size", 1)),
-        patch_size=int(_pick(cfg_model, "patch_size", 32)),
-        fusion_dim=int(_pick(cfg_model, "fusion_dim", 512)),
-        fusion_heads=int(_pick(cfg_model, "fusion_heads", 8)),
-        head_dropout=float(_pick(cfg_model, "head_dropout", 0.1)),
-        use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
-        bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
-    )
+    model_arch = str(mh.get("arch", _pick(cfg_model, "arch", "logic_v1"))).strip().lower()
+    if model_arch in ("logic_v2_dino", "logic_v2", "dino", "dinov2"):
+        model = LogicPhysModel2(
+            num_views=int(mh.get("num_views", max_views)),
+            in_channels=int(mh.get("in_channels", _pick(cfg_model, "in_channels", 3))),
+            num_frames=int(mh.get("num_frames", num_frames_model)),
+            img_size=int(_pick(cfg_model, "img_size", img_size if img_size > 0 else 224)),
+            num_targets=4,
+            num_actions=ds_train.num_actions,
+            dec_h=int(mh.get("dec_h", dec_h)),
+            dec_w=int(mh.get("dec_w", dec_w)),
+            fusion_dim=int(_pick(cfg_model, "fusion_dim", 512)),
+            fusion_heads=int(_pick(cfg_model, "fusion_heads", 8)),
+            head_dropout=float(_pick(cfg_model, "head_dropout", 0.1)),
+            use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
+            bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
+            dino_backbone_name=str(mh.get("dino_backbone_name", _pick(cfg_model, "dino_backbone_name", "dinov2_vits14"))),
+            dino_backbone_pretrained=bool(mh.get("dino_backbone_pretrained", _pick(cfg_model, "dino_backbone_pretrained", True))),
+            dino_backbone_source=str(mh.get("dino_backbone_source", _pick(cfg_model, "dino_backbone_source", "torchhub"))),
+            dino_out_dim=int(mh.get("dino_out_dim", _pick(cfg_model, "dino_out_dim", 384))),
+            temporal_adapter_type=str(mh.get("temporal_adapter_type", _pick(cfg_model, "temporal_adapter_type", "transformer"))),
+            temporal_adapter_layers=int(mh.get("temporal_adapter_layers", _pick(cfg_model, "temporal_adapter_layers", 2))),
+            temporal_adapter_heads=int(mh.get("temporal_adapter_heads", _pick(cfg_model, "temporal_adapter_heads", 6))),
+            temporal_adapter_dropout=float(mh.get("temporal_adapter_dropout", _pick(cfg_model, "temporal_adapter_dropout", 0.1))),
+            frame_pool=str(mh.get("frame_pool", _pick(cfg_model, "frame_pool", "mean"))),
+            freeze_backbone=bool(mh.get("freeze_backbone", _pick(cfg_model, "freeze_backbone", True))),
+            torchhub_dir=str(mh.get("torchhub_dir", _pick(cfg_model, "torchhub_dir", "")) or ""),
+            dino_force_reload=bool(mh.get("dino_force_reload", _pick(cfg_model, "dino_force_reload", False))),
+            dino_skip_validation=bool(mh.get("dino_skip_validation", _pick(cfg_model, "dino_skip_validation", True))),
+            dino_hub_verbose=bool(mh.get("dino_hub_verbose", _pick(cfg_model, "dino_hub_verbose", False))),
+            dino_log_torchhub_dir=bool(mh.get("dino_log_torchhub_dir", _pick(cfg_model, "dino_log_torchhub_dir", False))),
+        )
+    else:
+        model = LogicPhysModel(
+            num_views=int(mh.get("num_views", max_views)),
+            in_channels=int(mh.get("in_channels", _pick(cfg_model, "in_channels", 3))),
+            num_frames=int(mh.get("num_frames", num_frames_model)),
+            img_size=int(_pick(cfg_model, "img_size", img_size if img_size > 0 else 224)),
+            num_targets=4,
+            num_actions=ds_train.num_actions,
+            dec_h=int(mh.get("dec_h", dec_h)),
+            dec_w=int(mh.get("dec_w", dec_w)),
+            encoder_embed_dim=int(_pick(cfg_model, "encoder_embed_dim", 384)),
+            encoder_depth=int(_pick(cfg_model, "encoder_depth", 6)),
+            encoder_num_heads=int(_pick(cfg_model, "encoder_num_heads", 6)),
+            tubelet_size=int(_pick(cfg_model, "tubelet_size", 1)),
+            patch_size=int(_pick(cfg_model, "patch_size", 32)),
+            fusion_dim=int(_pick(cfg_model, "fusion_dim", 512)),
+            fusion_heads=int(_pick(cfg_model, "fusion_heads", 8)),
+            head_dropout=float(_pick(cfg_model, "head_dropout", 0.1)),
+            use_uncertainty=bool(_pick(cfg_model, "use_uncertainty", False)),
+            bottleneck_dim=int(_pick(cfg_model, "bottleneck_dim", 128)),
+        )
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.to(device)
     model.eval()

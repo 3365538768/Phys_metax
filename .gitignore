@@ -13,8 +13,9 @@ my_model/checkpoints/
 *.pt
 model
 log
+.torch
 # logic_model 训练输出、可视化跑批（大 / 本地生成）
 logic_model/output_*/
 logic_model/eval_visual_run/
 **/tensorboard/
-*.tfevents.*
+*.tfevents.*.torch/
